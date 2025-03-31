@@ -1,0 +1,13 @@
+argcomplete==3.5.0
+matplotlib==3.7.5
+ml-logger==0.10.24
+more-itertools==10.4.0
+multidict==6.0.5
+numpy<1.25.0
+plotly==5.23.0
+scipy==1.10.1
+seaborn==0.13.2
+tqdm==4.67.1
+wandb==0.17.7
+tensorboard==2.16.2
+configargparse
