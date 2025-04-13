@@ -5,8 +5,9 @@ import math
 import torch
 import numpy as np
 from multiprocessing import Pool
-import torch.nn as nn
+
 import scipy.io as spio
+import torch.nn.functional as F
 # during training, states will be sampled uniformly by each state dimension from the model-unit -1 to 1 range (for training stability),
 # which may or may not correspond to proper test ranges
 # note that coord refers to [time, *state], and input refers to whatever is fed directly to the model (often [time, *state, params])
@@ -36,11 +37,11 @@ class Dynamics(ABC):
         self.deepReach_model = deepReach_model
 
         assert self.loss_type in [
-            'brt_hjivi', 'brat_hjivi'], f'loss type {self.loss_type} not recognized'
+            'brt_hjivi', 'brat_hjivi', 'frs_hjivi'], f'loss type {self.loss_type} not recognized'
         if self.loss_type == 'brat_hjivi':
             assert callable(self.reach_fn) and callable(self.avoid_fn)
         assert self.set_mode in [
-            'reach', 'avoid', 'reach_avoid'], f'set mode {self.set_mode} not recognized'
+            'reach', 'avoid', 'reach_avoid', 'optimistic', 'conservative'], f'set mode {self.set_mode} not recognized'
         for state_descriptor in [self.state_mean, self.state_var]:
             assert len(state_descriptor) == self.state_dim, 'state descriptor dimension does not equal state dimension, ' + \
                 str(len(state_descriptor)) + ' != ' + str(self.state_dim)
@@ -438,7 +439,9 @@ class Dubins3D(Dynamics):
 
     def hamiltonian(self, state, dvds):
         if self.set_mode =="avoid":
-            return self.velocity * (torch.cos(state[..., 2]) * dvds[..., 0] + torch.sin(state[..., 2]) * dvds[..., 1]) + self.omega_max * torch.abs(dvds[..., 2]) 
+            ham=self.velocity * (torch.cos(state[..., 2]) * dvds[..., 0] + torch.sin(state[..., 2]) * dvds[..., 1]) + self.omega_max * torch.abs(dvds[..., 2]) 
+            print(state.shape,dvds.shape,ham.shape)
+            return ham
         elif self.set_mode =="reach":
             return self.velocity * (torch.cos(state[..., 2]) * dvds[..., 0] + torch.sin(state[..., 2]) * dvds[..., 1]) - self.omega_max * torch.abs(dvds[..., 2]) 
         else:
@@ -770,8 +773,6 @@ class Quadrotor(Dynamics):
             'z_axis_idx': 7,
         }
     
-
-
 class F1tenth(Dynamics):
     def __init__(self):
         # variable for dynamics
@@ -1268,4 +1269,1249 @@ class LessLinearND(Dynamics):
             'z_axis_idx': 2,
         }
 
+class Dubins9D(Dynamics):
+    # state: x, y, theta, v, mu_x, mu_y, sigma_x, sigma_y, rho
+    def __init__(self):
+        self.collisionR = 10
+        self.state_range_ = torch.tensor([[-60, 60],[-60, 60],[-math.pi, math.pi],[0,30],
+                                          [-1.5,1.5],[-10,10],[0.1,6],[0.1,15],[-math.pi, math.pi]]).cuda() 
+        self.control_range_ = torch.tensor([[-1.50, 1.5],[-10.0, 10.0]]).cuda()
+        self.eps_var=torch.tensor([6,15]).cuda()
+        self.control_init= torch.zeros(2).cuda()
+        state_mean_=(self.state_range_[:,0]+self.state_range_[:,1])/2.0
+        state_var_=(self.state_range_[:,1]-self.state_range_[:,0])/2.0
+        super().__init__(
+            name="Dubins9D", loss_type='brt_hjivi', set_mode="avoid",
+            state_dim=9, input_dim=12, control_dim=2, disturbance_dim=0,
+            state_mean=state_mean_.cpu().tolist(),
+            state_var=state_var_.cpu().tolist(),    
+            value_mean=7.5,
+            value_var=10,
+            value_normto=0.02,
+            deepReach_model='exact'
+        )
+
+    def control_range(self, state):
+        return self.control_range_.cpu().tolist()
+    
+    def state_test_range(self):
+        return self.state_range_.cpu().tolist()
+    
+    def state_verification_range(self):
+        return self.state_range_.cpu().tolist()
+
+    def equivalent_wrapped_state(self, state):
+        wrapped_state = torch.clone(state)
+        wrapped_state[..., 2] = (
+            wrapped_state[..., 2] + math.pi) % (2 * math.pi) - math.pi
+        wrapped_state[..., 8] = (
+            wrapped_state[..., 8] + math.pi) % (8 * math.pi) - math.pi
+        return wrapped_state
+
+    def periodic_transform_fn(self, input):
+        output_shape = list(input.shape)
+        output_shape[-1] = output_shape[-1]+2
+        transformed_input = torch.zeros(output_shape)
+        transformed_input[..., :3] = input[..., :3]
+        transformed_input[..., 3] = torch.sin(input[..., 3]*math.pi)
+        transformed_input[..., 4] = torch.cos(input[..., 3]*math.pi)
+        
+        transformed_input[..., 5:10] = input[..., 4:9]
+        transformed_input[..., 10] = torch.sin(input[..., 9]*math.pi)
+        transformed_input[..., 11] = torch.cos(input[..., 9]*math.pi)
+        return transformed_input.cuda()
+    # Dubins9D dynamics
+    # \dot x    = v \cos \theta
+    # \dot y    = v \sin \theta
+    # \dot \theta = omega
+    # \dot v = a
+    def dsdt(self, state, control, disturbance):
+        dsdt = torch.zeros_like(state) 
+        dsdt[..., 0] = state[...,3] * torch.cos(state[..., 2])
+        dsdt[..., 1] = state[...,3] * torch.sin(state[..., 2])
+        dsdt[..., 2] = control[..., 0]
+        dsdt[..., 3] = control[..., 1]
+        return dsdt
+
+    def boundary_fn(self, state):
+        return torch.norm(state[..., :2], dim=-1) - self.collisionR
+
+    def sample_target_state(self, num_samples):
+        raise NotImplementedError
+
+    def cost_fn(self, state_traj):
+        return torch.min(self.boundary_fn(state_traj), dim=-1).values
+
+    def hamiltonian(self, state, dvds):
+        
+        opt_control=self.optimal_control(state,dvds)
+        
+        dsdt_=self.dsdt(state,opt_control,None)
+        # 
+        ham=torch.sum(dvds*dsdt_,dim=-1)
+        # 
+        if torch.isnan(ham.sum(dim=1))[0]:
+            nan_mask = torch.isnan(opt_control[...,0])
+            print("!",torch.isnan(dvds.sum(dim=1)),torch.isnan(state.sum(dim=1)),"!")
+            print("?",torch.isnan(opt_control.sum(dim=1)),torch.isnan(dsdt_.sum(dim=1)),torch.isnan(ham.sum(dim=1)),"?")
+            print(state[nan_mask])
+            print(dvds[nan_mask])
+            print(opt_control[nan_mask])
+            exit()
+            
+        return ham
+        
+    def optimal_control(self, state, dvds):
+        xc = state[...,4].clone().squeeze(0)
+        yc = state[...,5].clone().squeeze(0)
+        a = state[...,6].clone().squeeze(0)
+        b = state[...,7].clone().squeeze(0)
+        angle = state[...,8].clone().squeeze(0)
+        V_theta = dvds[...,3].clone().squeeze(0)
+        V_v = dvds[...,4].clone().squeeze(0)
+
+        # Rotation matrices [N, 2, 2]
+        cos_t, sin_t = torch.cos(angle), torch.sin(angle)
+        R = torch.stack([
+            torch.stack([cos_t, -sin_t], dim=-1),
+            torch.stack([sin_t,  cos_t], dim=-1)
+        ], dim=-2)
+
+        # D^{-2} matrices [N, 2, 2]
+        Dinv2 = torch.zeros(xc.shape[0], 2, 2).to(xc)
+        Dinv2[:, 0, 0] = 1 / a**2
+        Dinv2[:, 1, 1] = 1 / b**2
+
+        # Q = R @ D^{-2} @ R^T
+        Q = R @ Dinv2 @ R.transpose(2,1)  # [N, 2, 2]
+        # v = [V_theta, V_v]
+        v = torch.stack([V_theta, V_v], dim=1)  # [N, 2]
+        Qinv = torch.linalg.inv(Q)         # [N, 2, 2]
+        Qinv_v = torch.einsum('nij,nj->ni', Qinv, v)  # [N, 2]
+        # denom = torch.sqrt(torch.einsum('ni,ni->n', v, Qinv_v)) + 1e-8 # [N]
+        unit_v = F.normalize(Qinv_v, dim=1, eps=1e-8)
+        # Center
+        c = torch.stack([xc, yc], dim=1)  # [N, 2]
+
+        # Optimal point (maximizing): x* = c + Qinv_v / sqrt(...)
+        # x_opt = c + Qinv_v / denom[:, None]  # [N, 2]
+        x_opt = c + unit_v
+        # # dV/dtheta == 0 or dV/dv ==0 will lead to nan. In this case, just make control to be the center
+        # x_opt[torch.isnan(x_opt)] = c[torch.isnan(x_opt)].clone()
+        # mask = (a == 0) & (Vv == 0)
+        # print(x_opt.shape)
+        # if verbose:
+        #     print(torch.isnan(x_opt.sum(dim=0)), torch.isnan(x_opt.sum(dim=0)))
+
+        return torch.clamp(x_opt[None, ...], self.control_range_[..., 0], self.control_range_[..., 1])
+
+    def optimal_disturbance(self, state, dvds):
+        return 0
+
+    def clamp_control(self, state, control):
+        # clamped to be within the ellipse
+        control_clamped=control*1.0
+        xc = state[...,4].clone()
+        yc = state[...,5].clone()
+        a = state[...,6].clone()
+        b = state[...,7].clone()
+        angle = state[...,8].clone()
+        if len(state.shape)==3:
+            cos_t = torch.cos(angle)
+            sin_t = torch.sin(angle)
+            R = torch.stack([
+                torch.stack([cos_t, -sin_t], dim=-1),
+                torch.stack([sin_t,  cos_t], dim=-1)
+            ], dim=-2)  # [S, B, 2, 2]
+            R_inv = R.transpose(-1, -2)  # [S, B, 2, 2]
+
+            # Centers: shape [S, B, 2]
+            centers = torch.stack([xc, yc], dim=-1)  # [S, B, 2]
+
+            # Shift and rotate to aligned frame
+            shifted = control_clamped - centers  # [S, B, 2]
+            rotated = torch.einsum('sbxy,sby->sbx', R_inv, shifted)  # [S, B, 2]
+
+            # Check ellipse constraint
+            ellipse_dist = (rotated[..., 0] / a) ** 2 + (rotated[..., 1] / b) ** 2  # [S, B]
+
+            # Clamp only if outside
+            scaling = torch.ones_like(ellipse_dist)
+            scaling[ellipse_dist > 1] = 1.0 / torch.sqrt(ellipse_dist[ellipse_dist > 1])
+            rotated_clamped = rotated * scaling.unsqueeze(-1)  # [S, B, 2]
+
+            # Rotate back to world frame
+            return torch.einsum('sbxy,sby->sbx', R, rotated_clamped) + centers  # [S, B, 2]
+        else:
+            # Rotation matrices: shape [N, 2, 2]
+            cos_t = torch.cos(angle)
+            sin_t = torch.sin(angle)
+            R = torch.stack([
+                torch.stack([cos_t, -sin_t], dim=-1),
+                torch.stack([sin_t,  cos_t], dim=-1)
+            ], dim=-2)  # [N, 2, 2]
+            R_inv = R.transpose(-1, -2)  # [N, 2, 2]
+
+            # Ellipse centers: [N, 2]
+            centers = torch.stack([xc, yc], dim=-1)  # [N, 2]
+
+            # Shift and rotate points into aligned frame
+            shifted = control_clamped - centers  # [N, 2]
+            rotated = torch.einsum('nij,nj->ni', R_inv, shifted)  # [N, 2]
+
+            # Ellipse constraint check
+            ellipse_dist = (rotated[:, 0] / a) ** 2 + (rotated[:, 1] / b) ** 2  # [N]
+
+            # Clamp points outside
+            scaling = torch.ones_like(ellipse_dist)
+            scaling[ellipse_dist > 1] = 1.0 / torch.sqrt(ellipse_dist[ellipse_dist > 1])
+            rotated_clamped = rotated * scaling.unsqueeze(-1)  # [N, 2]
+
+            # Transform back to world frame
+            return torch.einsum('nij,nj->ni', R, rotated_clamped) + centers  # [N, 2]
+
+    def plot_config(self):
+        return {
+            'state_slices': [0, 0, 0, 15, -1., 6, 0.3, 4, 0.0],
+            'state_labels': ['x', 'y', r'$\theta$', 'v', r'$\mu_w$', r'$\mu_a$', 'C', 'D', r'$\psi$'],
+            'x_axis_idx': 0,
+            'y_axis_idx': 1,
+            'z_axis_idx': 2,
+        }
+
+
+# class Dubins10D(Dynamics):
+#     #  FRS model
+#     #  state: x, y, theta, v, v_start, mu_x, mu_y, sigma_x, sigma_y, rho
+#     def __init__(self):
+#         self.collisionR = 2.0
+#         self.vel_tol = 3.0
+#         self.theta_tol = 0.3
+#         self.state_range_ = torch.tensor([[-60, 60],[-60, 60],[-math.pi, math.pi],[0,30], [0,20],
+#                                           [-1.5,1.5],[-10,10],[0.1,1],[0.1,6],[-math.pi, math.pi]]).cuda() 
+#         self.control_range_ = torch.tensor([[-1.5, 1.5],[-10.0, 10.0]]).cuda()
+#         self.eps_var=torch.tensor([0.3, 2]).cuda()
+#         self.control_init= torch.zeros(2).cuda()
+#         state_mean_=(self.state_range_[:,0]+self.state_range_[:,1])/2.0
+#         state_var_=(self.state_range_[:,1]-self.state_range_[:,0])/2.0
+
+#         self.init_state_=torch.tensor([-40., 0., 0]).cuda()
+#         super().__init__(
+#             name="Dubins10D", loss_type='frs_hjivi', set_mode='optimistic', # use avoid mode for more conservative FRT
+#             state_dim=10, input_dim=13, control_dim=2, disturbance_dim=0,
+#             state_mean=state_mean_.cpu().tolist(),
+#             state_var=state_var_.cpu().tolist(),    
+#             value_mean=0,
+#             value_var=2,
+#             value_normto=0.02,
+#             deepReach_model='exact'
+#         )
+
+#     def control_range(self, state):
+#         return self.control_range_.cpu().tolist()
+    
+#     def state_test_range(self):
+#         return self.state_range_.cpu().tolist()
+    
+#     def state_verification_range(self):
+#         return self.state_range_.cpu().tolist()
+
+#     def equivalent_wrapped_state(self, state):
+#         wrapped_state = torch.clone(state)
+#         wrapped_state[..., 2] = (
+#             wrapped_state[..., 2] + math.pi) % (2 * math.pi) - math.pi
+#         wrapped_state[..., 9] = (
+#             wrapped_state[..., 9] + math.pi) % (9 * math.pi) - math.pi
+#         return wrapped_state
+
+#     def periodic_transform_fn(self, input):
+#         output_shape = list(input.shape)
+#         output_shape[-1] = output_shape[-1]+2
+#         transformed_input = torch.zeros(output_shape)
+#         transformed_input[..., :3] = input[..., :3]
+#         transformed_input[..., 3] = torch.sin(input[..., 3]*math.pi)
+#         transformed_input[..., 4] = torch.cos(input[..., 3]*math.pi)
+        
+#         transformed_input[..., 5:11] = input[..., 4:10]
+#         transformed_input[..., 11] = torch.sin(input[..., 10]*math.pi)
+#         transformed_input[..., 12] = torch.cos(input[..., 10]*math.pi)
+#         return transformed_input.cuda()
+    
+#     # Dubins10D dynamics
+#     # \dot x    = v \cos \theta
+#     # \dot y    = v \sin \theta
+#     # \dot \theta = omega
+#     # \dot v = a
+#     def dsdt(self, state, control, disturbance):
+#         dsdt = torch.zeros_like(state) 
+#         dsdt[..., 0] = state[...,3] * torch.cos(state[..., 2])
+#         dsdt[..., 1] = state[...,3] * torch.sin(state[..., 2])
+#         dsdt[..., 2] = control[..., 0]
+#         dsdt[..., 3] = control[..., 1]
+#         return dsdt
+
+#     def boundary_fn(self, state):
+#         state_=state.clone()
+#         state_[...,0] += 40.0
+#         position_norm = torch.norm(state_[..., :2], dim=-1) - self.collisionR
+#         theta_diff = torch.abs(state_[..., 2] ) - self.theta_tol
+#         theta_diff[theta_diff<0]*=self.collisionR/self.theta_tol
+#         vel_diff = torch.abs(state_[..., 3]-state_[..., 4]) - self.vel_tol
+#         vel_diff[vel_diff<0]*=self.collisionR/self.vel_tol
+        
+#         lx=torch.maximum(position_norm,torch.maximum(theta_diff, vel_diff))
+#         lx[lx>0]*= self.collisionR/120.0
+#         return lx
+    
+#     def distance_fn(self, state, final_state):
+#         position_norm = torch.norm(state[..., :2] - final_state[..., :2], dim=-1) - self.collisionR
+#         theta_diff = torch.abs(state[..., 2] - final_state[..., 2]) - self.theta_tol
+#         theta_diff[theta_diff<0]*=self.collisionR/self.theta_tol
+#         vel_diff = torch.abs(state[..., 3] - final_state[..., 3]) - self.vel_tol
+#         vel_diff[vel_diff<0]*=self.collisionR/self.vel_tol
+        
+#         lx= torch.maximum(position_norm,torch.maximum(theta_diff, vel_diff))
+#         lx[lx>0]*= self.collisionR/120.0
+#         return lx
+    
+#     def get_initial_state_tensor(self, final_state):
+#         initial_state=final_state.clone()
+#         initial_state[..., 0]= -40 # x_init = -40
+#         initial_state[...,1:3]= 0.0 # y_init, theta_init = 0
+#         initial_state[..., 3] = final_state[..., 4]*1.0 # v_init = v_init
+#         return initial_state
+    
+#     def sample_target_state(self, num_samples):
+#         target_state_range = self.state_test_range()
+#         target_state_range[0] = [-5.0, 5.0]
+#         target_state_range[1] = [-5.0, 5.0]
+#         target_state_range[2] = [-0.5, 0.5]
+#         target_state_range = torch.tensor(target_state_range)
+#         return target_state_range[:, 0] + torch.rand(num_samples, self.state_dim)*(target_state_range[:, 1] - target_state_range[:, 0])
+
+#     def cost_fn(self, state_traj, final_state):
+#         return self.distance_fn(state_traj[...,-1, :], final_state)
+
+#     def hamiltonian(self, state, dvds):
+#         opt_control=self.optimal_control(state,dvds)
+#         dsdt_=self.dsdt(state,opt_control,None)
+#         ham=torch.sum(dvds*dsdt_,dim=-1)
+#         return ham
+        
+#     def optimal_control(self, state, dvds):
+#         xc = state[...,5].clone().squeeze(0)
+#         yc = state[...,6].clone().squeeze(0)
+#         a = state[...,7].clone().squeeze(0)
+#         b = state[...,8].clone().squeeze(0)
+#         angle = state[...,9].clone().squeeze(0)
+#         V_theta = dvds[...,3].clone().squeeze(0)
+#         V_v = dvds[...,4].clone().squeeze(0)
+
+#         # Rotation matrices [N, 2, 2]
+#         cos_t, sin_t = torch.cos(angle), torch.sin(angle)
+#         R = torch.stack([
+#             torch.stack([cos_t, -sin_t], dim=-1),
+#             torch.stack([sin_t,  cos_t], dim=-1)
+#         ], dim=-2)
+
+#         # D^{-2} matrices [N, 2, 2]
+#         Dinv2 = torch.zeros(xc.shape[0], 2, 2).to(xc)
+#         Dinv2[:, 0, 0] = 1 / a**2
+#         Dinv2[:, 1, 1] = 1 / b**2
+
+#         # Q = R @ D^{-2} @ R^T
+#         Q = R @ Dinv2 @ R.transpose(2,1)  # [N, 2, 2]
+#         # v = [V_theta, V_v]
+#         v = torch.stack([V_theta, V_v], dim=1)  # [N, 2]
+#         Qinv = torch.linalg.inv(Q)         # [N, 2, 2]
+#         Qinv_v = torch.einsum('nij,nj->ni', Qinv, v)  # [N, 2]
+#         # denom = torch.sqrt(torch.einsum('ni,ni->n', v, Qinv_v)) + 1e-8 # [N]
+#         unit_v = F.normalize(Qinv_v, dim=1, eps=1e-8)
+#         # Center
+#         c = torch.stack([xc, yc], dim=1)  # [N, 2]
+
+#         # Optimal point (maximizing): x* = c + Qinv_v / sqrt(...)
+#         # x_opt = c + Qinv_v / denom[:, None]  # [N, 2]
+#         x_opt = c + unit_v
+#         # # dV/dtheta == 0 or dV/dv ==0 will lead to nan. In this case, just make control to be the center
+#         # x_opt[torch.isnan(x_opt)] = c[torch.isnan(x_opt)].clone()
+#         # mask = (a == 0) & (Vv == 0)
+#         # print(x_opt.shape)
+#         # if verbose:
+#         #     print(torch.isnan(x_opt.sum(dim=0)), torch.isnan(x_opt.sum(dim=0)))
+
+#         return torch.clamp(x_opt[None, ...], self.control_range_[..., 0], self.control_range_[..., 1])
+
+#     def optimal_disturbance(self, state, dvds):
+#         return 0
+
+#     def clamp_control(self, state, control):
+#         # clamped to be within the ellipse
+#         control_clamped=control*1.0
+#         xc = state[...,5].clone()
+#         yc = state[...,6].clone()
+#         a = state[...,7].clone()
+#         b = state[...,8].clone()
+#         angle = state[...,9].clone()
+#         if len(state.shape)==3:
+#             cos_t = torch.cos(angle)
+#             sin_t = torch.sin(angle)
+#             R = torch.stack([
+#                 torch.stack([cos_t, -sin_t], dim=-1),
+#                 torch.stack([sin_t,  cos_t], dim=-1)
+#             ], dim=-2)  # [S, B, 2, 2]
+#             R_inv = R.transpose(-1, -2)  # [S, B, 2, 2]
+
+#             # Centers: shape [S, B, 2]
+#             centers = torch.stack([xc, yc], dim=-1)  # [S, B, 2]
+
+#             # Shift and rotate to aligned frame
+#             shifted = control_clamped - centers  # [S, B, 2]
+#             rotated = torch.einsum('sbxy,sby->sbx', R_inv, shifted)  # [S, B, 2]
+
+#             # Check ellipse constraint
+#             ellipse_dist = (rotated[..., 0] / a) ** 2 + (rotated[..., 1] / b) ** 2  # [S, B]
+
+#             # Clamp only if outside
+#             scaling = torch.ones_like(ellipse_dist)
+#             scaling[ellipse_dist > 1] = 1.0 / torch.sqrt(ellipse_dist[ellipse_dist > 1])
+#             rotated_clamped = rotated * scaling.unsqueeze(-1)  # [S, B, 2]
+
+#             # Rotate back to world frame
+#             return torch.einsum('sbxy,sby->sbx', R, rotated_clamped) + centers  # [S, B, 2]
+#         else:
+#             # Rotation matrices: shape [N, 2, 2]
+#             cos_t = torch.cos(angle)
+#             sin_t = torch.sin(angle)
+#             R = torch.stack([
+#                 torch.stack([cos_t, -sin_t], dim=-1),
+#                 torch.stack([sin_t,  cos_t], dim=-1)
+#             ], dim=-2)  # [N, 2, 2]
+#             R_inv = R.transpose(-1, -2)  # [N, 2, 2]
+
+#             # Ellipse centers: [N, 2]
+#             centers = torch.stack([xc, yc], dim=-1)  # [N, 2]
+
+#             # Shift and rotate points into aligned frame
+#             shifted = control_clamped - centers  # [N, 2]
+#             rotated = torch.einsum('nij,nj->ni', R_inv, shifted)  # [N, 2]
+
+#             # Ellipse constraint check
+#             ellipse_dist = (rotated[:, 0] / a) ** 2 + (rotated[:, 1] / b) ** 2  # [N]
+
+#             # Clamp points outside
+#             scaling = torch.ones_like(ellipse_dist)
+#             scaling[ellipse_dist > 1] = 1.0 / torch.sqrt(ellipse_dist[ellipse_dist > 1])
+#             rotated_clamped = rotated * scaling.unsqueeze(-1)  # [N, 2]
+
+#             # Transform back to world frame
+#             return torch.einsum('nij,nj->ni', R, rotated_clamped) + centers  # [N, 2]
+
+#     def plot_config(self):
+#         return {
+#             'state_slices': [0, 0, 0, 15, 15, -0.1, 3, 0.5, 4, 0.0],
+#             'state_labels': ['x', 'y', r'$\theta$', 'v', r'$\mu_w$', r'$\mu_a$', 'C', 'D', r'$\psi$'],
+#             'x_axis_idx': 0,
+#             'y_axis_idx': 1,
+#             'z_axis_idx': 2,
+#         }
+ 
+class Dubins10D(Dynamics): 
+    #  FRS model
+    #  state: x, y, theta, v, v_start, mu_x, mu_y, log(sigma_x), log(sigma_y), rho 
+    def __init__(self):
+        self.collisionR = 4.0
+        self.vel_tol = 3.0
+        self.theta_tol = 0.3
+        self.state_range_ = torch.tensor([[-60, 60],[-60, 60],[-math.pi, math.pi],[0,30], [0,20],
+                                          [-1.5,1.5],[-10,10],[-6,0],[-4,2.3],[-math.pi, math.pi]]).cuda() 
+        self.control_range_ = torch.tensor([[-1.5, 1.5],[-10.0, 10.0]]).cuda()
+        self.eps_var=torch.tensor([0.5, 4]).cuda()
+        # self.eps_var=torch.tensor([1, 30]).cuda()
+        self.control_init= torch.zeros(2).cuda()
+        state_mean_=(self.state_range_[:,0]+self.state_range_[:,1])/2.0
+        state_var_=(self.state_range_[:,1]-self.state_range_[:,0])/2.0
+
+        self.init_state_=torch.tensor([-40., 0., 0]).cuda()
+        super().__init__(
+            name="Dubins10D", loss_type='frs_hjivi', set_mode='optimistic', # use avoid mode for more conservative FRT
+            state_dim=10, input_dim=13, control_dim=2, disturbance_dim=0,
+            state_mean=state_mean_.cpu().tolist(),
+            state_var=state_var_.cpu().tolist(),    
+            value_mean=0,
+            value_var=4,
+            value_normto=0.02,
+            deepReach_model='exact'
+        )
+
+    def control_range(self, state):
+        return self.control_range_.cpu().tolist()
+    
+    def state_test_range(self):
+        return self.state_range_.cpu().tolist()
+    
+    def state_verification_range(self):
+        return self.state_range_.cpu().tolist()
+
+    def equivalent_wrapped_state(self, state):
+        wrapped_state = torch.clone(state)
+        wrapped_state[..., 2] = (
+            wrapped_state[..., 2] + math.pi) % (2 * math.pi) - math.pi
+        wrapped_state[..., 9] = (
+            wrapped_state[..., 9] + math.pi) % (9 * math.pi) - math.pi
+        return wrapped_state
+
+    def periodic_transform_fn(self, input):
+        output_shape = list(input.shape)
+        output_shape[-1] = output_shape[-1]+2
+        transformed_input = torch.zeros(output_shape)
+        transformed_input[..., :3] = input[..., :3]
+        transformed_input[..., 3] = torch.sin(input[..., 3]*math.pi)
+        transformed_input[..., 4] = torch.cos(input[..., 3]*math.pi)
+        
+        transformed_input[..., 5:11] = input[..., 4:10]
+        transformed_input[..., 11] = torch.sin(input[..., 10]*math.pi)
+        transformed_input[..., 12] = torch.cos(input[..., 10]*math.pi)
+        return transformed_input.cuda()
+    
+    # Dubins10D dynamics
+    # \dot x    = v \cos \theta
+    # \dot y    = v \sin \theta
+    # \dot \theta = omega
+    # \dot v = a
+    def dsdt(self, state, control, disturbance):
+        dsdt = torch.zeros_like(state) 
+        dsdt[..., 0] = state[...,3] * torch.cos(state[..., 2])
+        dsdt[..., 1] = state[...,3] * torch.sin(state[..., 2])
+        dsdt[..., 2] = control[..., 0]
+        dsdt[..., 3] = control[..., 1]
+        return dsdt
+
+    def boundary_fn(self, state):
+        state_=state.clone()
+        state_[...,0] += 40.0
+        position_norm = torch.norm(state_[..., :2], dim=-1) - self.collisionR
+        theta_diff = torch.abs(state_[..., 2] ) - self.theta_tol
+        theta_diff[theta_diff<0]*=self.collisionR/self.theta_tol
+        vel_diff = torch.abs(state_[..., 3]-state_[..., 4]) - self.vel_tol
+        vel_diff[vel_diff<0]*=self.collisionR/self.vel_tol
+        
+        lx=torch.maximum(position_norm,torch.maximum(theta_diff, vel_diff))
+        lx[lx>0]*= self.collisionR/120.0
+        return lx
+    
+    def distance_fn(self, state, final_state):
+        position_norm = torch.norm(state[..., :2] - final_state[..., :2], dim=-1) - self.collisionR
+        theta_diff = torch.abs(state[..., 2] - final_state[..., 2]) - self.theta_tol
+        theta_diff[theta_diff<0]*=self.collisionR/self.theta_tol
+        vel_diff = torch.abs(state[..., 3] - final_state[..., 3]) - self.vel_tol
+        vel_diff[vel_diff<0]*=self.collisionR/self.vel_tol
+        
+        lx= torch.maximum(position_norm,torch.maximum(theta_diff, vel_diff))
+        lx[lx>0]*= self.collisionR/120.0
+        return lx
+    
+    def get_initial_state_tensor(self, final_state):
+        initial_state=final_state.clone()
+        initial_state[..., 0]= -40 # x_init = -40
+        initial_state[...,1:3]= 0.0 # y_init, theta_init = 0
+        initial_state[..., 3] = final_state[..., 4]*1.0 # v_init = v_init
+        return initial_state
+    
+    def sample_target_state(self, num_samples):
+        target_state_range = self.state_test_range()
+        target_state_range[0] = [-45.0, -35.0]
+        target_state_range[1] = [-5.0, 5.0]
+        target_state_range[2] = [-0.5, 0.5]
+        target_state_range = torch.tensor(target_state_range)
+        return target_state_range[:, 0] + torch.rand(num_samples, self.state_dim)*(target_state_range[:, 1] - target_state_range[:, 0])
+
+    def cost_fn(self, state_traj, final_state):
+        return self.distance_fn(state_traj[...,-1, :], final_state)
+
+    def hamiltonian(self, state, dvds, t=None, T=None):
+        opt_control=self.optimal_control(state,dvds, t, T)
+        dsdt_=self.dsdt(state,opt_control,None)
+        ham=torch.sum(dvds*dsdt_,dim=-1)
+        return ham
+        
+    def optimal_control(self, state, dvds, t=None, T=None):
+        xc = state[...,5].clone().squeeze(0)
+        yc = state[...,6].clone().squeeze(0)
+        a = torch.exp(state[...,7].clone()).squeeze(0)
+        b = torch.exp(state[...,8].clone()).squeeze(0)
+        angle = state[...,9].clone().squeeze(0)
+        V_theta = dvds[...,3].clone().squeeze(0)
+        V_v = dvds[...,4].clone().squeeze(0)
+
+        # Rotation matrices [N, 2, 2]
+        cos_t, sin_t = torch.cos(angle), torch.sin(angle)
+        R = torch.stack([
+            torch.stack([cos_t, -sin_t], dim=-1),
+            torch.stack([sin_t,  cos_t], dim=-1)
+        ], dim=-2)
+
+        # D^{-2} matrices [N, 2, 2]
+        Dinv2 = torch.zeros(xc.shape[0], 2, 2).to(xc)
+        Dinv2[:, 0, 0] = 1 / a**2
+        Dinv2[:, 1, 1] = 1 / b**2
+
+        # Q = R @ D^{-2} @ R^T
+        Q = R @ Dinv2 @ R.transpose(2,1)  # [N, 2, 2]
+        # v = [V_theta, V_v]
+        v = torch.stack([V_theta, V_v], dim=1)  # [N, 2]
+        Qinv = torch.linalg.inv(Q)         # [N, 2, 2]
+        Qinv_v = torch.einsum('nij,nj->ni', Qinv, v)  # [N, 2]
+        # denom = torch.sqrt(torch.einsum('ni,ni->n', v, Qinv_v)) + 1e-8 # [N]
+        unit_v = F.normalize(Qinv_v, dim=1, eps=1e-8)
+        # Center
+        c = torch.stack([xc, yc], dim=1)  # [N, 2]
+
+        # Optimal point (maximizing): x* = c + Qinv_v / sqrt(...)
+        # x_opt = c + Qinv_v / denom[:, None]  # [N, 2]
+        x_opt = c + unit_v
+        # # dV/dtheta == 0 or dV/dv ==0 will lead to nan. In this case, just make control to be the center
+        # x_opt[torch.isnan(x_opt)] = c[torch.isnan(x_opt)].clone()
+        # mask = (a == 0) & (Vv == 0)
+        # print(x_opt.shape)
+        # if verbose:
+        #     print(torch.isnan(x_opt.sum(dim=0)), torch.isnan(x_opt.sum(dim=0)))
+
+        return torch.clamp(x_opt[None, ...], self.control_range_[..., 0], self.control_range_[..., 1])
+
+    def optimal_disturbance(self, state, dvds):
+        return 0
+
+    def clamp_control(self, state, control, t=None, T=None):
+        # clamped to be within the ellipse
+        control_clamped=control*1.0
+        xc = state[...,5].clone()
+        yc = state[...,6].clone()
+        a = torch.exp(state[...,7].clone())
+        b = torch.exp(state[...,8].clone())
+        angle = state[...,9].clone()
+        if len(state.shape)==3:
+            cos_t = torch.cos(angle)
+            sin_t = torch.sin(angle)
+            R = torch.stack([
+                torch.stack([cos_t, -sin_t], dim=-1),
+                torch.stack([sin_t,  cos_t], dim=-1)
+            ], dim=-2)  # [S, B, 2, 2]
+            R_inv = R.transpose(-1, -2)  # [S, B, 2, 2]
+
+            # Centers: shape [S, B, 2]
+            centers = torch.stack([xc, yc], dim=-1)  # [S, B, 2]
+
+            # Shift and rotate to aligned frame
+            shifted = control_clamped - centers  # [S, B, 2]
+            rotated = torch.einsum('sbxy,sby->sbx', R_inv, shifted)  # [S, B, 2]
+
+            # Check ellipse constraint
+            ellipse_dist = (rotated[..., 0] / a) ** 2 + (rotated[..., 1] / b) ** 2  # [S, B]
+
+            # Clamp only if outside
+            scaling = torch.ones_like(ellipse_dist)
+            scaling[ellipse_dist > 1] = 1.0 / torch.sqrt(ellipse_dist[ellipse_dist > 1])
+            rotated_clamped = rotated * scaling.unsqueeze(-1)  # [S, B, 2]
+
+            # Rotate back to world frame
+            return torch.einsum('sbxy,sby->sbx', R, rotated_clamped) + centers  # [S, B, 2]
+        else:
+            # Rotation matrices: shape [N, 2, 2]
+            cos_t = torch.cos(angle)
+            sin_t = torch.sin(angle)
+            R = torch.stack([
+                torch.stack([cos_t, -sin_t], dim=-1),
+                torch.stack([sin_t,  cos_t], dim=-1)
+            ], dim=-2)  # [N, 2, 2]
+            R_inv = R.transpose(-1, -2)  # [N, 2, 2]
+
+            # Ellipse centers: [N, 2]
+            centers = torch.stack([xc, yc], dim=-1)  # [N, 2]
+
+            # Shift and rotate points into aligned frame
+            shifted = control_clamped - centers  # [N, 2]
+            rotated = torch.einsum('nij,nj->ni', R_inv, shifted)  # [N, 2]
+
+            # Ellipse constraint check
+            ellipse_dist = (rotated[:, 0] / a) ** 2 + (rotated[:, 1] / b) ** 2  # [N]
+
+            # Clamp points outside
+            scaling = torch.ones_like(ellipse_dist)
+            scaling[ellipse_dist > 1] = 1.0 / torch.sqrt(ellipse_dist[ellipse_dist > 1])
+            rotated_clamped = rotated * scaling.unsqueeze(-1)  # [N, 2]
+
+            # Transform back to world frame
+            return torch.einsum('nij,nj->ni', R, rotated_clamped) + centers  # [N, 2]
+
+    def plot_config(self):
+        return {
+            'state_slices': [0, 0, 0, 15, 16, 0., 1, -2, 1.6, 0.0],
+            'state_labels': ['x', 'y', r'$\theta$', 'v', r'$\mu_w$', r'$\mu_a$', 'C', 'D', r'$\psi$'],
+            'x_axis_idx': 0,
+            'y_axis_idx': 1,
+            'z_axis_idx': 2,
+        }
+
+
+
+class Dubins15D(Dynamics): 
+    #  FRS model
+    #  state: x, y, theta, v, v_start, mu_x, mu_y, log(sigma_x), log(sigma_y), rho 
+    def __init__(self):
+        self.collisionR = 4.0
+        self.vel_tol = 3.0
+        self.theta_tol = 0.3
+        self.state_range_ = torch.tensor([[-60, 60],[-60, 60],[-math.pi, math.pi],[0,30], [0,20],
+                                          [-1.5,1.5],[-10,10],[-6,-1],[-4,2.3],[-math.pi, math.pi],
+                                          [-1.5,1.5],[-10,10],[-6,-1],[-4,2.3],[-math.pi, math.pi]]).cuda() 
+        self.control_range_ = torch.tensor([[-1.5, 1.5],[-10.0, 10.0]]).cuda()
+        self.eps_var=torch.tensor([0.5, 4]).cuda()
+        # self.eps_var=torch.tensor([1, 30]).cuda()
+        self.control_init= torch.zeros(2).cuda()
+        state_mean_=(self.state_range_[:,0]+self.state_range_[:,1])/2.0
+        state_var_=(self.state_range_[:,1]-self.state_range_[:,0])/2.0
+
+        self.init_state_=torch.tensor([-40., 0., 0]).cuda()
+        super().__init__(
+            name="Dubins15D", loss_type='frs_hjivi', set_mode='optimistic', # use avoid mode for more conservative FRT
+            state_dim=15, input_dim=19, control_dim=2, disturbance_dim=0,
+            state_mean=state_mean_.cpu().tolist(),
+            state_var=state_var_.cpu().tolist(),    
+            value_mean=0,
+            value_var=4,
+            value_normto=0.02,
+            deepReach_model='exact'
+        )
+
+    def control_range(self, state):
+        return self.control_range_.cpu().tolist()
+    
+    def state_test_range(self):
+        return self.state_range_.cpu().tolist()
+    
+    def state_verification_range(self):
+        return self.state_range_.cpu().tolist()
+
+    def equivalent_wrapped_state(self, state):
+        wrapped_state = torch.clone(state)
+        wrapped_state[..., 2] = (
+            wrapped_state[..., 2] + math.pi) % (2 * math.pi) - math.pi
+        wrapped_state[..., 9] = (
+            wrapped_state[..., 9] + math.pi) % (9 * math.pi) - math.pi
+        wrapped_state[..., 14] = (
+            wrapped_state[..., 14] + math.pi) % (9 * math.pi) - math.pi
+        return wrapped_state
+
+    def periodic_transform_fn(self, input):
+        output_shape = list(input.shape)
+        output_shape[-1] = output_shape[-1]+3
+        transformed_input = torch.zeros(output_shape)
+        transformed_input[..., :3] = input[..., :3]
+        transformed_input[..., 3] = torch.sin(input[..., 3]*math.pi)
+        transformed_input[..., 4] = torch.cos(input[..., 3]*math.pi)
+        
+        transformed_input[..., 5:11] = input[..., 4:10]
+        transformed_input[..., 11] = torch.sin(input[..., 10]*math.pi)
+        transformed_input[..., 12] = torch.cos(input[..., 10]*math.pi)
+
+        transformed_input[..., 13:17] = input[..., 11:15]
+        transformed_input[..., 17] = torch.sin(input[..., 15]*math.pi)
+        transformed_input[..., 18] = torch.cos(input[..., 15]*math.pi)
+        return transformed_input.cuda()
+    
+    # Dubins10D dynamics
+    # \dot x    = v \cos \theta
+    # \dot y    = v \sin \theta
+    # \dot \theta = omega
+    # \dot v = a
+    def dsdt(self, state, control, disturbance):
+        dsdt = torch.zeros_like(state) 
+        dsdt[..., 0] = state[...,3] * torch.cos(state[..., 2])
+        dsdt[..., 1] = state[...,3] * torch.sin(state[..., 2])
+        dsdt[..., 2] = control[..., 0]
+        dsdt[..., 3] = control[..., 1]
+        return dsdt
+
+    def boundary_fn(self, state):
+        state_=state.clone()
+        state_[...,0] += 40.0
+        position_norm = torch.norm(state_[..., :2], dim=-1) - self.collisionR
+        theta_diff = torch.abs(state_[..., 2] ) - self.theta_tol
+        theta_diff[theta_diff<0]*=self.collisionR/self.theta_tol
+        vel_diff = torch.abs(state_[..., 3]-state_[..., 4]) - self.vel_tol
+        vel_diff[vel_diff<0]*=self.collisionR/self.vel_tol
+        
+        lx=torch.maximum(position_norm,torch.maximum(theta_diff, vel_diff))
+        lx[lx>0]*= self.collisionR/120.0
+        return lx
+    
+    def distance_fn(self, state, final_state):
+        position_norm = torch.norm(state[..., :2] - final_state[..., :2], dim=-1) - self.collisionR
+        theta_diff = torch.abs(state[..., 2] - final_state[..., 2]) - self.theta_tol
+        theta_diff[theta_diff<0]*=self.collisionR/self.theta_tol
+        vel_diff = torch.abs(state[..., 3] - final_state[..., 3]) - self.vel_tol
+        vel_diff[vel_diff<0]*=self.collisionR/self.vel_tol
+        
+        lx= torch.maximum(position_norm,torch.maximum(theta_diff, vel_diff))
+        lx[lx>0]*= self.collisionR/120.0
+        return lx
+    
+    def get_initial_state_tensor(self, final_state):
+        initial_state=final_state.clone()
+        initial_state[..., 0]= -40 # x_init = -40
+        initial_state[...,1:3]= 0.0 # y_init, theta_init = 0
+        initial_state[..., 3] = final_state[..., 4]*1.0 # v_init = v_init
+        return initial_state
+    
+    def sample_target_state(self, num_samples):
+        target_state_range = self.state_test_range()
+        target_state_range[0] = [-45, -35]
+        target_state_range[1] = [-5, 5]
+        target_state_range[2] = [-0.5, 0.5]
+        target_state_range = torch.tensor(target_state_range)
+        return target_state_range[:, 0] + torch.rand(num_samples, self.state_dim)*(target_state_range[:, 1] - target_state_range[:, 0])
+
+    def cost_fn(self, state_traj, final_state):
+        return self.distance_fn(state_traj[...,-1, :], final_state)
+
+    def hamiltonian(self, state, dvds, t=None, T=None):
+        opt_control=self.optimal_control(state,dvds, t, T)
+        dsdt_=self.dsdt(state,opt_control,None)
+        ham=torch.sum(dvds*dsdt_,dim=-1)
+        return ham
+        
+    def optimal_control(self, state, dvds, t=None, T=None):
+        time_progress=t/T
+        xc = (state[...,5]*(1-time_progress)+state[...,10]*time_progress).squeeze(0)
+        yc = (state[...,6]*(1-time_progress)+state[...,11]*time_progress).squeeze(0)
+        a = torch.exp((state[...,7]*(1-time_progress)+state[...,12]*time_progress)).squeeze(0)
+        b = torch.exp((state[...,8]*(1-time_progress)+state[...,13]*time_progress)).squeeze(0)
+        angle = (state[...,9]*(1-time_progress)+state[...,14]*time_progress).squeeze(0)
+
+        V_theta = dvds[...,3].clone().squeeze(0)
+        V_v = dvds[...,4].clone().squeeze(0)
+
+        # Rotation matrices [N, 2, 2]
+        cos_t, sin_t = torch.cos(angle), torch.sin(angle)
+        R = torch.stack([
+            torch.stack([cos_t, -sin_t], dim=-1),
+            torch.stack([sin_t,  cos_t], dim=-1)
+        ], dim=-2)
+
+        # D^{-2} matrices [N, 2, 2]
+        Dinv2 = torch.zeros(xc.shape[0], 2, 2).to(xc)
+        Dinv2[:, 0, 0] = 1 / a**2
+        Dinv2[:, 1, 1] = 1 / b**2
+
+        # Q = R @ D^{-2} @ R^T
+        Q = R @ Dinv2 @ R.transpose(2,1)  # [N, 2, 2]
+        # v = [V_theta, V_v]
+        v = torch.stack([V_theta, V_v], dim=1)  # [N, 2]
+        Qinv = torch.linalg.inv(Q)         # [N, 2, 2]
+        Qinv_v = torch.einsum('nij,nj->ni', Qinv, v)  # [N, 2]
+        # denom = torch.sqrt(torch.einsum('ni,ni->n', v, Qinv_v)) + 1e-8 # [N]
+        unit_v = F.normalize(Qinv_v, dim=1, eps=1e-8)
+        # Center
+        c = torch.stack([xc, yc], dim=1)  # [N, 2]
+
+        # Optimal point (maximizing): x* = c + Qinv_v / sqrt(...)
+        # x_opt = c + Qinv_v / denom[:, None]  # [N, 2]
+        x_opt = c + unit_v
+        # # dV/dtheta == 0 or dV/dv ==0 will lead to nan. In this case, just make control to be the center
+        # x_opt[torch.isnan(x_opt)] = c[torch.isnan(x_opt)].clone()
+        # mask = (a == 0) & (Vv == 0)
+        # print(x_opt.shape)
+        # if verbose:
+        #     print(torch.isnan(x_opt.sum(dim=0)), torch.isnan(x_opt.sum(dim=0)))
+
+        return torch.clamp(x_opt[None, ...], self.control_range_[..., 0], self.control_range_[..., 1])
+
+    def optimal_disturbance(self, state, dvds):
+        return 0
+
+    def clamp_control(self, state, control, t=None, T=None):
+        # clamped to be within the ellipse
+        control_clamped=control*1.0
+        time_progress=t/T
+        xc = (state[...,5]*(1-time_progress)+state[...,10]*time_progress).squeeze(0)
+        yc = (state[...,6]*(1-time_progress)+state[...,11]*time_progress).squeeze(0)
+        a = torch.exp((state[...,7]*(1-time_progress)+state[...,12]*time_progress)).squeeze(0)
+        b = torch.exp((state[...,8]*(1-time_progress)+state[...,13]*time_progress)).squeeze(0)
+        angle = (state[...,9]*(1-time_progress)+state[...,14]*time_progress).squeeze(0)
+        if len(state.shape)==3:
+            cos_t = torch.cos(angle)
+            sin_t = torch.sin(angle)
+            R = torch.stack([
+                torch.stack([cos_t, -sin_t], dim=-1),
+                torch.stack([sin_t,  cos_t], dim=-1)
+            ], dim=-2)  # [S, B, 2, 2]
+            R_inv = R.transpose(-1, -2)  # [S, B, 2, 2]
+
+            # Centers: shape [S, B, 2]
+            centers = torch.stack([xc, yc], dim=-1)  # [S, B, 2]
+
+            # Shift and rotate to aligned frame
+            shifted = control_clamped - centers  # [S, B, 2]
+            rotated = torch.einsum('sbxy,sby->sbx', R_inv, shifted)  # [S, B, 2]
+
+            # Check ellipse constraint
+            ellipse_dist = (rotated[..., 0] / a) ** 2 + (rotated[..., 1] / b) ** 2  # [S, B]
+
+            # Clamp only if outside
+            scaling = torch.ones_like(ellipse_dist)
+            scaling[ellipse_dist > 1] = 1.0 / torch.sqrt(ellipse_dist[ellipse_dist > 1])
+            rotated_clamped = rotated * scaling.unsqueeze(-1)  # [S, B, 2]
+
+            # Rotate back to world frame
+            return torch.einsum('sbxy,sby->sbx', R, rotated_clamped) + centers  # [S, B, 2]
+        else:
+            # Rotation matrices: shape [N, 2, 2]
+            cos_t = torch.cos(angle)
+            sin_t = torch.sin(angle)
+            R = torch.stack([
+                torch.stack([cos_t, -sin_t], dim=-1),
+                torch.stack([sin_t,  cos_t], dim=-1)
+            ], dim=-2)  # [N, 2, 2]
+            R_inv = R.transpose(-1, -2)  # [N, 2, 2]
+
+            # Ellipse centers: [N, 2]
+            centers = torch.stack([xc, yc], dim=-1)  # [N, 2]
+
+            # Shift and rotate points into aligned frame
+            shifted = control_clamped - centers  # [N, 2]
+            rotated = torch.einsum('nij,nj->ni', R_inv, shifted)  # [N, 2]
+
+            # Ellipse constraint check
+            ellipse_dist = (rotated[:, 0] / a) ** 2 + (rotated[:, 1] / b) ** 2  # [N]
+
+            # Clamp points outside
+            scaling = torch.ones_like(ellipse_dist)
+            scaling[ellipse_dist > 1] = 1.0 / torch.sqrt(ellipse_dist[ellipse_dist > 1])
+            rotated_clamped = rotated * scaling.unsqueeze(-1)  # [N, 2]
+
+            # Transform back to world frame
+            return torch.einsum('nij,nj->ni', R, rotated_clamped) + centers  # [N, 2]
+
+    def plot_config(self):
+        return {
+            'state_slices': [0, 0, 0, 15, 15, 0., 1, -2, 1.6, 0.0, 0., -1, -2, 1.6, 0.0],
+            'state_labels': ['x', 'y', r'$\theta$', 'v', r'$\mu_w$', r'$\mu_a$', 'C', 'D', r'$\psi$', r'$\mu_w$', r'$\mu_a$', 'C', 'D', r'$\psi$'],
+            'x_axis_idx': 0,
+            'y_axis_idx': 1,
+            'z_axis_idx': 2,
+        }
+
+
+class Dubins13D(Dynamics): 
+    #  FRS model
+    #  state: x, y, theta, v, v_start, mu_x, mu_y, log(sigma_x), log(sigma_y), rho 
+    def __init__(self):
+        self.collisionR = 4.0
+        self.vel_tol = 3.0
+        self.theta_tol = 0.3
+        self.state_range_ = torch.tensor([[-60, 60],[-60, 60],[-math.pi, math.pi],[0,30], [0,20],
+                                          [-1.5,1.5],[-10,10],[-6,-1],[-4,2.3],
+                                          [-1.5,1.5],[-10,10],[-6,-1],[-4,2.3]]).cuda() 
+        self.control_range_ = torch.tensor([[-1.5, 1.5],[-10.0, 10.0]]).cuda()
+        self.eps_var=torch.tensor([0.5, 4]).cuda()
+        # self.eps_var=torch.tensor([1, 30]).cuda()
+        self.control_init= torch.zeros(2).cuda()
+        state_mean_=(self.state_range_[:,0]+self.state_range_[:,1])/2.0
+        state_var_=(self.state_range_[:,1]-self.state_range_[:,0])/2.0
+
+        self.init_state_=torch.tensor([-40., 0., 0]).cuda()
+        super().__init__(
+            name="Dubins13D", loss_type='frs_hjivi', set_mode='conservative', # set_mode='optimistic', # use avoid mode for more conservative FRT
+            state_dim=13, input_dim=15, control_dim=2, disturbance_dim=0,
+            state_mean=state_mean_.cpu().tolist(),
+            state_var=state_var_.cpu().tolist(),    
+            value_mean=0,
+            value_var=4,
+            value_normto=0.02,
+            deepReach_model='exact'
+        )
+
+    def control_range(self, state):
+        return self.control_range_.cpu().tolist()
+    
+    def state_test_range(self):
+        return self.state_range_.cpu().tolist()
+    
+    def state_verification_range(self):
+        return self.state_range_.cpu().tolist()
+
+    def equivalent_wrapped_state(self, state):
+        wrapped_state = torch.clone(state)
+        wrapped_state[..., 2] = (
+            wrapped_state[..., 2] + math.pi) % (2 * math.pi) - math.pi
+        return wrapped_state
+
+    def periodic_transform_fn(self, input):
+        output_shape = list(input.shape)
+        output_shape[-1] = output_shape[-1]+1
+        transformed_input = torch.zeros(output_shape)
+        transformed_input[..., :3] = input[..., :3]
+        transformed_input[..., 3] = torch.sin(input[..., 3]*math.pi)
+        transformed_input[..., 4] = torch.cos(input[..., 3]*math.pi)
+        
+        transformed_input[..., 5:] = input[..., 4:]
+        return transformed_input.cuda()
+    
+    # Dubins10D dynamics
+    # \dot x    = v \cos \theta
+    # \dot y    = v \sin \theta
+    # \dot \theta = omega
+    # \dot v = a
+    def dsdt(self, state, control, disturbance):
+        dsdt = torch.zeros_like(state) 
+        dsdt[..., 0] = state[...,3] * torch.cos(state[..., 2])
+        dsdt[..., 1] = state[...,3] * torch.sin(state[..., 2])
+        dsdt[..., 2] = control[..., 0]
+        dsdt[..., 3] = control[..., 1]
+        return dsdt
+
+    def boundary_fn(self, state):
+        state_=state.clone()
+        state_[...,0] += 40.0
+        position_norm = torch.norm(state_[..., :2], dim=-1) - self.collisionR
+        theta_diff = torch.abs(state_[..., 2] ) - self.theta_tol
+        theta_diff[theta_diff<0]*=self.collisionR/self.theta_tol
+        vel_diff = torch.abs(state_[..., 3]-state_[..., 4]) - self.vel_tol
+        vel_diff[vel_diff<0]*=self.collisionR/self.vel_tol
+        
+        lx=torch.maximum(position_norm,torch.maximum(theta_diff, vel_diff))
+        lx[lx>0]*= self.collisionR/120.0
+        return lx
+    
+    def distance_fn(self, state, final_state):
+        position_norm = torch.norm(state[..., :2] - final_state[..., :2], dim=-1) - self.collisionR
+        theta_diff = torch.abs(state[..., 2] - final_state[..., 2]) - self.theta_tol
+        theta_diff[theta_diff<0]*=self.collisionR/self.theta_tol
+        vel_diff = torch.abs(state[..., 3] - final_state[..., 3]) - self.vel_tol
+        vel_diff[vel_diff<0]*=self.collisionR/self.vel_tol
+        
+        lx= torch.maximum(position_norm,torch.maximum(theta_diff, vel_diff))
+        lx[lx>0]*= self.collisionR/120.0
+        return lx
+    
+    def get_initial_state_tensor(self, final_state):
+        initial_state=final_state.clone()
+        initial_state[..., 0]= -40 # x_init = -40
+        initial_state[...,1:3]= 0.0 # y_init, theta_init = 0
+        initial_state[..., 3] = final_state[..., 4]*1.0 # v_init = v_init
+        return initial_state
+    
+    def sample_target_state(self, num_samples):
+        target_state_range = self.state_test_range()
+        target_state_range[0] = [-45, -35]
+        target_state_range[1] = [-5, 5]
+        target_state_range[2] = [-0.5, 0.5]
+        target_state_range = torch.tensor(target_state_range)
+        return target_state_range[:, 0] + torch.rand(num_samples, self.state_dim)*(target_state_range[:, 1] - target_state_range[:, 0])
+
+    def cost_fn(self, state_traj, final_state):
+        return self.distance_fn(state_traj[...,-1, :], final_state)
+
+    def hamiltonian(self, state, dvds, t=None, T=None):
+        opt_control=self.optimal_control(state,dvds, t, T)
+        dsdt_=self.dsdt(state,opt_control,None)
+        ham=torch.sum(dvds*dsdt_,dim=-1)
+        return ham
+        
+    def optimal_control(self, state, dvds, t=None, T=None):
+        time_progress=t/T
+        if (time_progress<0).any() or (time_progress>1).any():
+            exit()
+        xc = (state[...,5]*(1-time_progress)+state[...,9]*time_progress).squeeze(0)
+        yc = (state[...,6]*(1-time_progress)+state[...,10]*time_progress).squeeze(0)
+        a = torch.exp((state[...,7]*(1-time_progress)+state[...,11]*time_progress)).squeeze(0)
+        b = torch.exp((state[...,8]*(1-time_progress)+state[...,12]*time_progress)).squeeze(0)
+
+        V_theta = dvds[...,3].clone().squeeze(0)
+        V_v = dvds[...,4].clone().squeeze(0)
+
+        # Q matrices [N, 2, 2]
+        Qinv  = torch.zeros(xc.shape[0], 2, 2).to(xc)
+        Qinv[:, 0, 0] = a**2
+        Qinv[:, 1, 1] = b**2
+
+        # v = [V_theta, V_v]
+        v = torch.stack([V_theta, V_v], dim=1)  # [N, 2]
+        Qinv_v = torch.einsum('nij,nj->ni', Qinv, v)  # [N, 2]
+        # denom = torch.sqrt(torch.einsum('ni,ni->n', v, Qinv_v)) + 1e-8 # [N]
+        unit_v = F.normalize(Qinv_v, dim=1, eps=1e-8)
+        # Center
+        c = torch.stack([xc, yc], dim=1)  # [N, 2]
+
+        # Optimal point (maximizing): x* = c + Qinv_v / sqrt(...)
+        # x_opt = c + Qinv_v / denom[:, None]  # [N, 2]
+        x_opt = c + unit_v
+        return torch.clamp(x_opt[None, ...], self.control_range_[..., 0], self.control_range_[..., 1])
+
+    def optimal_disturbance(self, state, dvds):
+        return 0
+
+    def clamp_control(self, state, control, t=None, T=None):
+        # clamped to be within the ellipse
+        control_clamped=control*1.0
+        time_progress=t/T
+        xc = (state[...,5]*(1-time_progress)+state[...,9]*time_progress).squeeze(0)
+        yc = (state[...,6]*(1-time_progress)+state[...,10]*time_progress).squeeze(0)
+        if time_progress<0 or time_progress>1:
+            exit()
+        a = torch.exp((state[...,7]*(1-time_progress)+state[...,11]*time_progress)).squeeze(0)
+        b = torch.exp((state[...,8]*(1-time_progress)+state[...,12]*time_progress)).squeeze(0)
+        if len(state.shape)==3:
+            # Centers: shape [S, B, 2]
+            centers = torch.stack([xc, yc], dim=-1)  # [S, B, 2]
+
+            # Shift and rotate to aligned frame
+            shifted = control_clamped - centers  # [S, B, 2]
+
+            # Check ellipse constraint
+            ellipse_dist = (shifted[..., 0] / a) ** 2 + (shifted[..., 1] / b) ** 2  # [S, B]
+
+            # Clamp only if outside
+            scaling = torch.ones_like(ellipse_dist)
+            scaling[ellipse_dist > 1] = 1.0 / torch.sqrt(ellipse_dist[ellipse_dist > 1])
+            shifted_clamped = shifted * scaling.unsqueeze(-1)  # [S, B, 2]
+
+            # shift back to world frame
+            return shifted_clamped + centers  # [S, B, 2]
+        else:
+            # Ellipse centers: [N, 2]
+            centers = torch.stack([xc, yc], dim=-1)  # [N, 2]
+
+            # Shift and rotate points into aligned frame
+            shifted = control_clamped - centers  # [N, 2]
+            
+            # Ellipse constraint check
+            ellipse_dist = (shifted[:, 0] / a) ** 2 + (shifted[:, 1] / b) ** 2  # [N]
+
+            # Clamp points outside
+            scaling = torch.ones_like(ellipse_dist)
+            scaling[ellipse_dist > 1] = 1.0 / torch.sqrt(ellipse_dist[ellipse_dist > 1])
+            shifted_clamped = shifted * scaling.unsqueeze(-1)  # [N, 2]
+
+            # Transform back to world frame
+            return shifted_clamped + centers  # [N, 2]
+
+    def plot_config(self):
+        return {
+            'state_slices': [0, 0, 0, 15, 15, 0., 1, -2, 1.6, 0., -1, -2, 1.6],
+            'state_labels': ['x', 'y', r'$\theta$', 'v', r'$\mu_w$', r'$\mu_a$', 'C', 'D', r'$\mu_w$', r'$\mu_a$', r'C_{end}', r'D_{end}'],
+            'x_axis_idx': 0,
+            'y_axis_idx': 1,
+            'z_axis_idx': 11,
+        }
+
+class Dubins3DFRS(Dynamics):
+    def __init__(self):
+        self.goalR = 0.5
+        self.velocity = 1.
+        self.omega_max = 1.2
+        self.state_range_ = torch.tensor([[-2, 2],[-2, 2],[-math.pi, math.pi]]).cuda()
+        self.control_range_ =torch.tensor([[-self.omega_max, self.omega_max]]).cuda()
+        self.eps_var=torch.tensor([0.5]).cuda()
+        self.control_init= torch.zeros(1).cuda()
+        self.collisionR=0.5
+        self.theta_tol=0.1
+
+        state_mean_=(self.state_range_[:,0]+self.state_range_[:,1])/2.0
+        state_var_=(self.state_range_[:,1]-self.state_range_[:,0])/2.0
+        super().__init__(
+            name="Dubins3DFRS", loss_type='frs_hjivi', set_mode='optimistic',
+            state_dim=3, input_dim=5, control_dim=1, disturbance_dim=0,
+            state_mean=state_mean_.cpu().tolist(),
+            state_var=state_var_.cpu().tolist(),    
+            value_mean=1.5,
+            value_var=2,
+            value_normto=0.02,
+            deepReach_model='exact'
+        )
+
+    def control_range(self, state):
+        return [[-self.omega_max, self.omega_max]]
+
+    def state_test_range(self):
+        return self.state_range_.cpu().tolist()
+    
+    def state_verification_range(self):
+        return self.state_range_.cpu().tolist()
+
+    def equivalent_wrapped_state(self, state):
+        wrapped_state = torch.clone(state)
+        wrapped_state[..., 2] = (
+            wrapped_state[..., 2] + math.pi) % (2 * math.pi) - math.pi
+        return wrapped_state
+
+    def periodic_transform_fn(self, input):
+        output_shape = list(input.shape)
+        output_shape[-1] = output_shape[-1]+1
+        transformed_input = torch.zeros(output_shape)
+        transformed_input[..., :3] = input[..., :3]
+        transformed_input[..., 3] = torch.sin(input[..., 3]*self.state_var[-1])
+        transformed_input[..., 4] = torch.cos(input[..., 3]*self.state_var[-1])
+        return transformed_input.cuda()
+    
+    # Dubins3D dynamics
+    # \dot x    = v \cos \theta
+    # \dot y    = v \sin \theta
+    # \dot \theta = u
+
+    def dsdt(self, state, control, disturbance):
+        dsdt = torch.zeros_like(state)
+        dsdt[..., 0] = self.velocity * torch.cos(state[..., 2])
+        dsdt[..., 1] = self.velocity * torch.sin(state[..., 2])
+        dsdt[..., 2] = control[..., 0]
+        return dsdt
+
+
+    def boundary_fn(self, state):
+        state_=state.clone()
+        state_[...,0] += 0.3
+        position_norm = torch.norm(state_[..., :2], dim=-1) - self.collisionR
+        theta_diff = torch.abs(state_[..., 2] ) - self.theta_tol
+        theta_diff[theta_diff<0]*=self.collisionR/self.theta_tol
+        return torch.maximum(position_norm, theta_diff)
+    
+    def distance_fn(self, state, final_state):
+        position_norm = torch.norm(state[..., :2] - final_state[..., :2], dim=-1) - self.collisionR
+        theta_diff = torch.abs(state[..., 2] - final_state[..., 2]) - self.theta_tol
+        theta_diff[theta_diff<0]*=self.collisionR/self.theta_tol
+        return torch.maximum(position_norm,theta_diff)
+    
+    def get_initial_state_tensor(self, final_state):
+        initial_state=final_state.clone()
+        initial_state[..., 0]= -0.3 # x_init = -40
+        initial_state[...,1:]= 0.0 # y_init, theta_init = 0
+        return initial_state
+
+    def sample_target_state(self, num_samples):
+        raise NotImplementedError
+
+    def cost_fn(self, state_traj, final_state):
+        return self.distance_fn(state_traj[...,-1, :], final_state)
+
+    def hamiltonian(self, state, dvds, t=None, T=None):
+        
+        ham=self.velocity * (torch.cos(state[..., 2]) * dvds[..., 0] + torch.sin(state[..., 2]) * dvds[..., 1]) + self.omega_max * torch.abs(dvds[..., 2]) 
+        return ham
+        
+    def optimal_control(self, state, dvds, t=None, T=None):
+        return (self.omega_max * torch.sign(dvds[..., 2]))[..., None]
+        
+
+    def optimal_disturbance(self, state, dvds):
+        return 0
+
+    def plot_config(self):
+        return {
+            'state_slices': [0, 0, 0],
+            'state_labels': ['x', 'y', r'$\theta$'],
+            'x_axis_idx': 0,
+            'y_axis_idx': 1,
+            'z_axis_idx': 2,
+        }
    

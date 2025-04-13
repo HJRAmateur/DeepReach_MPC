@@ -96,6 +96,8 @@ if (mode == 'all') or (mode == 'train'):
                    help='use MPC loss') 
     p.add_argument('--not_refine_dataset', default=False, action='store_true',
                    help='refine MPC dataset') # whether we refine the MPC dataset every H_R seconds (see paper)
+    p.add_argument('--PDE_curr', default=False, action='store_true',
+                   help='use PDE curr instead of time curr') 
     p.add_argument('--MPC_finetune_lambda', type=float, default=100.0,
                    help='MPC finetuning weight for False Positives') # working fine but tunable. can be lower if causing instability
     p.add_argument('--num_MPC_data_samples', type=int, default=5000,
@@ -194,7 +196,7 @@ if (mode == 'all') or (mode == 'train'):
     
     # loss options
     p.add_argument('--minWith', type=str, required=False, default= 'target', choices=[
-                   'none', 'zero', 'target'], help='BRS vs BRT computation (typically should be using target for BRT)')
+                   'none', 'zero', 'target', 'FRS'], help='BRS vs BRT computation (typically should be using target for BRT)')
     # min with none will yield BRS, while min with zero/target corresponding to HJB-PDE and HJB-VI for computing BRT.
     # Typically min with target works better than min with zero
     
@@ -330,7 +332,7 @@ dataset = dataio.ReachabilityDataset(
     MPC_lambda_ = orig_opt.MPC_lambda_, MPC_batch_size = orig_opt.MPC_batch_size, MPC_receding_horizon= orig_opt.MPC_receding_horizon, 
     num_MPC_data_samples = orig_opt.num_MPC_data_samples, num_iterative_refinement=orig_opt.num_iterative_refinement,
     time_till_refinement=orig_opt.time_till_refinement,num_MPC_batches=orig_opt.num_MPC_batches, 
-    aug_with_MPC_data= orig_opt.aug_with_MPC_data, policy=policy, refine_dataset=(not orig_opt.not_refine_dataset))
+    aug_with_MPC_data= orig_opt.aug_with_MPC_data, policy=policy, refine_dataset=(not orig_opt.not_refine_dataset), PDE_curr= orig_opt.PDE_curr)
 
 experiment_class = getattr(experiments, orig_opt.experiment_class)
 experiment = experiment_class(
@@ -344,6 +346,9 @@ if (mode == 'all') or (mode == 'train'):
             dynamics, orig_opt.minWith, orig_opt.dirichlet_loss_divisor, orig_opt.MPC_loss_type, (not orig_opt.not_use_MPC), MPC_finetune_lambda = orig_opt.MPC_finetune_lambda)
     elif dynamics.loss_type == 'brat_hjivi':
         loss_fn = losses.init_brat_hjivi_loss(
+            dynamics, orig_opt.minWith, orig_opt.dirichlet_loss_divisor, orig_opt.MPC_loss_type, (not orig_opt.not_use_MPC), MPC_finetune_lambda = orig_opt.MPC_finetune_lambda)
+    elif dynamics.loss_type == 'frs_hjivi':
+        loss_fn = losses.init_frs_hjivi_loss(
             dynamics, orig_opt.minWith, orig_opt.dirichlet_loss_divisor, orig_opt.MPC_loss_type, (not orig_opt.not_use_MPC), MPC_finetune_lambda = orig_opt.MPC_finetune_lambda)
     else:
         raise NotImplementedError

@@ -55,8 +55,10 @@ def init_brt_hjivi_loss(dynamics, minWith, dirichlet_loss_divisor, MPC_loss_type
             ham = dynamics.hamiltonian(state, dvds)
             if minWith == 'zero':
                 ham = torch.clamp(ham, max=0.0)
-
-            diff_constraint_hom = dvdt - ham
+            if minWith == "FRS":
+                diff_constraint_hom = dvdt + ham
+            else:
+                diff_constraint_hom = dvdt - ham
             if minWith == 'target':
                 diff_constraint_hom = torch.max(
                     diff_constraint_hom, value - boundary_value)
@@ -123,3 +125,67 @@ def init_brat_hjivi_loss(dynamics, minWith, dirichlet_loss_divisor, MPC_loss_typ
                 'diff_constraint_hom': torch.abs(diff_constraint_hom).sum(),
                 'mpc_loss': mpc_loss,}
     return brat_hjivi_loss
+
+
+
+def init_frs_hjivi_loss(dynamics, minWith, dirichlet_loss_divisor, MPC_loss_type, use_MPC, MPC_finetune_lambda):
+    def frs_hjivi_loss(state, value, dvdt, dvds, boundary_value, dirichlet_mask, output, MPC_values, MPC_labels,
+                        use_MPC_terminal_loss=False, t=None, T=None):
+        # Curriculum training loss
+        if dynamics.deepReach_model == 'exact':
+            dirichlet_loss = torch.Tensor([0]).cuda()
+        else:
+            dirichlet = value[dirichlet_mask] - boundary_value[dirichlet_mask]
+            dirichlet_loss=torch.abs(dirichlet).sum() / dirichlet_loss_divisor
+        if MPC_loss_type=='l1':
+            mpc_loss=torch.abs(MPC_values-MPC_labels).sum()
+            if use_MPC_terminal_loss:
+                #scale critical values
+                if dynamics.set_mode == 'optimistic':
+                    unsafe_cost_safe_value_indeces = torch.argwhere(
+                        torch.logical_and(MPC_labels.squeeze(0) < 0.0, MPC_values.squeeze(0) >= 0.0)).detach().squeeze(-1) # the predicted FRS will be larger than MPC FRS
+                    
+                elif dynamics.set_mode == 'conservative':
+                    unsafe_cost_safe_value_indeces = torch.argwhere(
+                        torch.logical_and(MPC_labels.squeeze(0) > 0.0, MPC_values.squeeze(0) <= 0.0)).detach().squeeze(-1) # the predicted FRS will be smaller than MPC FRS
+                else:
+                    raise NotImplementedError
+                mpc_loss+=(torch.abs(MPC_values[:,unsafe_cost_safe_value_indeces]-MPC_labels[:,unsafe_cost_safe_value_indeces])*
+                        torch.abs(MPC_values[:,unsafe_cost_safe_value_indeces])).sum()*MPC_finetune_lambda
+
+
+        elif MPC_loss_type=='l2':
+            mpc_loss=torch.pow(MPC_values-MPC_labels,2).sum() 
+            #scale critical values
+            if use_MPC_terminal_loss:
+                if dynamics.set_mode == 'optimistic':
+                    unsafe_cost_safe_value_indeces = torch.argwhere(
+                        torch.logical_and(MPC_labels.squeeze(0) < 0.0, MPC_values.squeeze(0) >= 0.0)).detach().squeeze(-1)
+                elif dynamics.set_mode == 'conservative':
+                    unsafe_cost_safe_value_indeces = torch.argwhere(
+                        torch.logical_and(MPC_labels.squeeze(0) > 0.0, MPC_values.squeeze(0) <= 0.0)).detach().squeeze(-1)
+                else:
+                    raise NotImplementedError
+        
+                mpc_loss+=(torch.pow(MPC_values[:,unsafe_cost_safe_value_indeces]-MPC_labels[:,unsafe_cost_safe_value_indeces],2)
+                        * torch.abs(MPC_values[:,unsafe_cost_safe_value_indeces])).sum()*MPC_finetune_lambda
+        else:
+            raise NotImplementedError
+        
+
+        if torch.all(dirichlet_mask): # pretraining loss
+            diff_constraint_hom = torch.Tensor([0]).cuda()
+            if dynamics.deepReach_model == 'exact':
+                dirichlet = output.squeeze(dim=-1)[dirichlet_mask]-0.0
+                dirichlet_loss=torch.abs(dirichlet).sum() 
+        else:
+            ham = dynamics.hamiltonian(state, dvds, t, T)
+            
+            diff_constraint_hom = dvdt + ham # for FRS
+            
+        return {'dirichlet': dirichlet_loss,
+                'diff_constraint_hom': torch.abs(diff_constraint_hom).sum(),
+                'mpc_loss': mpc_loss,
+                }
+
+    return frs_hjivi_loss

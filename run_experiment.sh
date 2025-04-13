@@ -34,7 +34,7 @@ python run_experiment.py --mode train --experiment_name Dubins --dynamics_class 
 python run_experiment.py --mode train --experiment_name Dubins_vanilla --dynamics_class Dubins3D --tMax 1 --pretrain --pretrain_iters 1000 --num_epochs 11000 --counter_end 10000 --num_nl 128 --set_mode reach --lr 5e-5 --num_iterative_refinement 10 --MPC_batch_size 1000 --num_MPC_batches 3 --num_MPC_data_samples 500 --numpoints 5000 --use_wandb --wandb_project MPC --wandb_name Dubins_vanilla --wandb_group Dubins3D --wandb_entity YOUR_WANDB_NAME --not_use_MPC
 
 # to learn the safety problem
-python run_experiment.py --mode train --experiment_name Dubins_avoid --dynamics_class Dubins3D --tMax 1 --pretrain --pretrain_iters 1000 --num_epochs 13000 --counter_end 10000 --num_nl 128 --set_mode avoid --lr 5e-5 --num_iterative_refinement 10 --MPC_batch_size 1000 --num_MPC_batches 3 --num_MPC_data_samples 500 --numpoints 5000 --use_wandb --wandb_project MPC --wandb_name Dubins_avoid --wandb_group Dubins3D --wandb_entity YOUR_WANDB_NAME
+python run_experiment.py --mode train --experiment_name Dubins_avoid --dynamics_class Dubins3D --tMax 1 --pretrain --pretrain_iters 1000 --num_epochs 13000 --counter_end 10000 --num_nl 128 --set_mode avoid --lr 5e-5 --num_iterative_refinement 10 --MPC_batch_size 1000 --num_MPC_batches 3 --num_MPC_data_samples 500 --numpoints 5000 --use_wandb --wandb_project MPC --wandb_name Dubins_avoid --wandb_group Dubins3D --wandb_entity zeyuanfe
 
 ############################################## Quadrotor ##########################################
 # To train (exp time: 3h on RTX 4090)
@@ -52,3 +52,29 @@ python run_experiment.py --mode train --experiment_name LessLinear40D --use_wand
 python run_experiment.py --mode test --experiment_name LessLinear40D --checkpoint_toload -1 --data_step run_basic_recovery
 # To plot validation. Plot available under ./runs/VD/basic_BRTs.png
 python run_experiment.py --mode test --experiment_name LessLinear40D --checkpoint_toload -1 --data_step plot_ND
+
+
+
+############################################# Dubins 9D BRT ############################################
+python run_experiment.py --mode train --experiment_name Dubins9D --dynamics_class Dubins9D --tMax 3 --pretrain --pretrain_iters 3000 --num_epochs 30000 --counter_end 25000 --num_nl 256 --lr 3e-5 --num_iterative_refinement 10 --MPC_batch_size 1000 --num_MPC_batches 15 --num_MPC_data_samples 500 --numpoints 20000 --use_wandb --wandb_project MPC --wandb_name Dubins9D --wandb_group Dubins9D --wandb_entity zeyuanfe --MPC_dt 0.1 --time_till_refinement 1.0
+
+############################################# Dubins 10D FRS ############################################
+python run_experiment.py --mode train --experiment_name Dubins10D_vanilla3 --dynamics_class Dubins10D --tMax 4.5 --num_epochs 100000 --counter_end 90000 --num_nl 512 --lr 3e-6 --MPC_batch_size 10000 --num_MPC_batches 60 --num_MPC_data_samples 5000 --numpoints 100000 --use_wandb --wandb_project MPC --wandb_name Dubins10D_vanilla3 --wandb_group Dubins10D --wandb_entity zeyuanfe --MPC_dt 0.1 --not_refine_dataset --minWith FRS --MPC_receding_horizon 1 --deepReach_model vanilla --num_target_samples 3000 --MPC_loss_type l1 --MPC_decay_scheme exponential --pretrained_model Dubins10D_vanilla  --MPC_finetune_lambda 10 --MPC_style receding
+
+
+
+python run_experiment.py --mode train --experiment_name Dubins10D_PDEcurr_conserv2 --dynamics_class Dubins10D --tMax 4 --num_epochs 10000 --counter_start 29999 --counter_end 30000 --num_nl 512 --lr 1e-6 --MPC_batch_size 10000 --num_MPC_batches 60 --num_MPC_data_samples 3000 --numpoints 30000 --use_wandb --wandb_project MPC --wandb_name Dubins10D_PDEcurr_conserv2 --wandb_group Dubins10D --wandb_entity zeyuanfe --MPC_dt 0.1 --not_refine_dataset --minWith FRS --MPC_receding_horizon 1 --deepReach_model vanilla --num_target_samples 3000 --MPC_loss_type l2 --MPC_importance_init 0.003 --MPC_decay_scheme exponential --PDE_curr --MPC_finetune_lambda 100 --pretrained_model Dubins10D_PDEcurr_conserv_vanilla --MPC_style receding
+
+
+
+############################################# Dubins 13D FRS ############################################
+python run_experiment.py --mode train --experiment_name Dubins13D_vanilla --dynamics_class Dubins13D --tMax 4.5 --pretrain --pretrain_iters 10000 --num_epochs 100000 --counter_end 80000 --num_nl 512 --lr 1e-5 --MPC_batch_size 10000 --num_MPC_batches 60 --num_MPC_data_samples 5000 --numpoints 100000 --use_wandb --wandb_project MPC --wandb_name Dubins13D_vanilla --wandb_group Dubins13D --wandb_entity zeyuanfe --MPC_dt 0.1 --not_refine_dataset --minWith FRS --MPC_receding_horizon 1 --deepReach_model vanilla --num_target_samples 3000 --MPC_loss_type l1 --MPC_decay_scheme exponential --MPC_finetune_lambda 10 --MPC_style receding
+
+
+python run_experiment.py --mode train --experiment_name Dubins13D_vanilla3 --dynamics_class Dubins13D --tMax 4.5  --num_epochs 10000 --counter_start 79999 --counter_end 80000 --num_nl 512 --lr 1e-6 --MPC_batch_size 10000 --num_MPC_batches 60 --num_MPC_data_samples 5000 --numpoints 100000 --use_wandb --wandb_project MPC --wandb_name Dubins13D_vanilla3 --wandb_group Dubins13D --wandb_entity zeyuanfe --MPC_dt 0.1 --not_refine_dataset --minWith FRS --MPC_receding_horizon 1 --deepReach_model vanilla --num_target_samples 3000 --MPC_loss_type l1 --MPC_decay_scheme exponential --MPC_finetune_lambda 10 --MPC_style receding --pretrained_model Dubins13D --MPC_data_path ./data/dubins13D_20aug
+
+python run_experiment.py --mode train --experiment_name Dubins13D_conservative3 --dynamics_class Dubins13D --tMax 4.5  --num_epochs 40000 --counter_end 30000 --num_nl 512 --lr 6e-6 --MPC_batch_size 10000 --num_MPC_batches 60 --num_MPC_data_samples 20000 --numpoints 100000 --use_wandb --wandb_project MPC --wandb_name Dubins13D_conservative3 --wandb_group Dubins13D --wandb_entity zeyuanfe --MPC_dt 0.1 --not_refine_dataset --minWith FRS --MPC_receding_horizon 1 --deepReach_model vanilla --num_target_samples 3000 --MPC_loss_type l1 --MPC_decay_scheme exponential --MPC_finetune_lambda 3 --MPC_style receding --pretrained_model Dubins13D_conservative --MPC_data_path ./data/dubins13D
+############################################# Dubins 3D FRS ############################################
+python run_experiment.py --mode train --experiment_name Dubins3DFRS --dynamics_class Dubins3DFRS --tMax 1 --pretrain --pretrain_iters 2000 --num_epochs 30000 --counter_end 27000 --num_nl 256 --lr 3e-5 --num_iterative_refinement 10 --MPC_batch_size 1000 --num_MPC_batches 10 --num_MPC_data_samples 500 --numpoints 20000 --use_wandb --wandb_project MPC --wandb_name Dubins3DFRS --wandb_group Dubins3DFRS --wandb_entity zeyuanfe --MPC_dt 0.02 --not_refine_dataset --minWith FRS --MPC_finetune_lambda 10 --MPC_receding_horizon 1 --deepReach_model vanilla
+
+python run_experiment.py --mode train --experiment_name Dubins3DFRS_vanilla --dynamics_class Dubins3DFRS --tMax 1 --pretrain --pretrain_iters 1000 --num_epochs 30000 --counter_end 29000 --num_nl 256 --lr 3e-5 --num_iterative_refinement 10 --MPC_batch_size 1000 --num_MPC_batches 15 --num_MPC_data_samples 500 --numpoints 20000 --use_wandb --wandb_project MPC --wandb_name Dubins3DFRS_vanilla --wandb_group Dubins3DFRS --wandb_entity zeyuanfe --MPC_dt 0.02 --time_till_refinement 1.0 --minWith FRS --not_use_MPC 

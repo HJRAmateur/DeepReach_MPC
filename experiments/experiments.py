@@ -29,6 +29,8 @@ class Experiment(ABC):
         self.use_wandb = use_wandb
         ## Dynamic Weighting
         self.loss_weights = {'dirichlet': 1., 'mpc_loss': 1., 'diff_constraint_hom': 1.}
+        if self.dataset.PDE_curr:
+            self.loss_weights = {'dirichlet': 1., 'mpc_loss': 1., 'diff_constraint_hom': 0.}
 
     @abstractmethod
     def init_special(self):
@@ -97,6 +99,9 @@ class Experiment(ABC):
                 
                 if self.dataset.refine_dataset:
                     self.dataset_refinement(time_interval_length, epoch)
+
+                if self.dataset.counter>self.dataset.counter_end:
+                    self.use_MPC_terminal_loss=True
                     
 
                 # semi-supervised learning
@@ -143,6 +148,10 @@ class Experiment(ABC):
                         losses = loss_fn(
                             states, values, dvs[..., 0], dvs[..., 1:], boundary_values, dirichlet_masks, model_results['model_out'],
                             MPC_values, gt['MPC_values'],self.use_MPC_terminal_loss)
+                    elif self.dataset.dynamics.loss_type == 'frs_hjivi':
+                        losses = loss_fn(
+                            states, values, dvs[..., 0], dvs[..., 1:], boundary_values, dirichlet_masks, model_results['model_out'],
+                            MPC_values, gt['MPC_values'], self.use_MPC_terminal_loss, model_results['model_in'].detach()[...,0], self.dataset.tMax)
                     elif self.dataset.dynamics.loss_type == 'brat_hjivi':
                         losses = loss_fn(
                             states, values, dvs[..., 0], dvs[..., 1:], boundary_values, reach_values, avoid_values, dirichlet_masks, model_results[
@@ -191,11 +200,12 @@ class Experiment(ABC):
                         if self.use_wandb:
                             wandb.log({
                                 'train_loss': train_loss,
-                                'boundary_loss': losses['dirichlet'],
+                                'boundary_loss': losses['dirichlet']/self.dataset.num_src_samples,
                                 'pde_loss': losses['diff_constraint_hom']/self.dataset.numpoints,
                                 'mpc_loss': losses['mpc_loss']/self.dataset.num_MPC_data_samples,
                                 'mpc_importance': self.mpc_importance_coef,
                                 'mpc_weight': self.loss_weights['mpc_loss'], 
+                                'pde_weight': self.loss_weights['diff_constraint_hom'], 
                             })
 
                     total_steps += 1
@@ -1053,33 +1063,75 @@ class Experiment(ABC):
             self.model.requires_grad_(True)
 
     def adjust_rel_weight(self, losses, MPC_decay_scheme, epoch, epochs, model_input):
-        if self.dataset.dynamics.deepReach_model in ['vanilla', 'diff'] and losses['diff_constraint_hom'] > 0.01:
-            params = OrderedDict(self.model.named_parameters())
-            # Gradients with respect to the PDE loss
-            self.optim.zero_grad()
-            losses['diff_constraint_hom'].backward(
-                retain_graph=True)
-            grads_PDE = []
-            for key, param in params.items():
-                grads_PDE.append(param.grad.view(-1))
-            grads_PDE = torch.cat(grads_PDE)
+        if not self.dataset.PDE_curr: # regular time curriculum in the paper
+            if self.dataset.dynamics.deepReach_model in ['vanilla', 'diff'] and (self.dataset.counter>=1) and losses['diff_constraint_hom'] > 0.01:
+                params = OrderedDict(self.model.named_parameters())
+                # Gradients with respect to the PDE loss
+                self.optim.zero_grad()
+                losses['diff_constraint_hom'].backward(
+                    retain_graph=True)
+                grads_PDE = []
+                for key, param in params.items():
+                    # grads_PDE.append(param.grad.view(-1))
+                    if param.grad is not None:
+                        grads_PDE.append(param.grad.view(-1))
+                # exit()
+                grads_PDE = torch.cat(grads_PDE)
+                
+                
+                # print(losses['diff_constraint_hom'])
+                # Gradients with respect to the boundary loss
+                self.optim.zero_grad()
+                losses['dirichlet'].backward(retain_graph=True)
+                grads_dirichlet = []
+                for key, param in params.items():
+                    grads_dirichlet.append(param.grad.view(-1))
+                grads_dirichlet = torch.cat(grads_dirichlet)
 
-            # Gradients with respect to the boundary loss
-            self.optim.zero_grad()
-            losses['dirichlet'].backward(retain_graph=True)
-            grads_dirichlet = []
-            for key, param in params.items():
-                grads_dirichlet.append(param.grad.view(-1))
-            grads_dirichlet = torch.cat(grads_dirichlet)
+                # Set the new weight according to the paper
+                # num = torch.max(torch.abs(grads_PDE))
+                num = torch.mean(torch.abs(grads_PDE))
+                den = torch.mean(torch.abs(grads_dirichlet))
+                self.loss_weights['dirichlet'] = 0.9*self.loss_weights['dirichlet'] + 0.1*num/den
+                # losses['dirichlet'] = self.loss_weights['dirichlet'] * \
+                    # losses['dirichlet']
+                if (self.dataset.counter>=1) and len(model_input['MPC_inputs'].shape)>2:
+                    if MPC_decay_scheme=="exponential":
+                        if self.MPC_importance_final<= self.MPC_importance_init:
+                            self.mpc_importance_coef = self.MPC_importance_final * math.e**(math.log(self.MPC_importance_init/self.MPC_importance_final)*(1-(epoch - self.dataset.pretrain_iters)/(epochs - 1 - self.dataset.pretrain_iters))) 
+                        else:
+                            self.mpc_importance_coef = self.MPC_importance_final * math.e**(math.log(self.MPC_importance_init/self.MPC_importance_final)*(epoch - self.dataset.pretrain_iters)/(epochs - 1 - self.dataset.pretrain_iters))
+                            self.mpc_importance_coef = self.MPC_importance_final + self.MPC_importance_init - self.mpc_importance_coef
+                    elif MPC_decay_scheme=="linear":
+                        self.mpc_importance_coef=self.MPC_importance_init+(self.MPC_importance_final-self.MPC_importance_init)*(epoch - self.dataset.pretrain_iters)/(epochs - self.dataset.pretrain_iters)
+                    else: 
+                        raise NotImplementedError
+                    
+                    # Gradients with respect to the mpc loss
+                    self.optim.zero_grad()
+                    losses['mpc_loss'].backward(retain_graph=True)
+                    grads_mpc = []
+                    for key, param in params.items():
+                        grads_mpc.append(param.grad.view(-1))
+                    grads_mpc = torch.cat(grads_mpc)
+                    # Set the new weight according to the paper 
+                    den = torch.mean(torch.abs(grads_mpc))
+                    
+                    self.loss_weights['mpc_loss'] = 0.9*self.loss_weights['mpc_loss'] + 0.1*self.mpc_importance_coef*num/(den+1e-16)
+                    
+            elif self.dataset.dynamics.deepReach_model == 'exact' and (self.dataset.counter>=1) and losses['mpc_loss'] > 1e-8:
 
-            # Set the new weight according to the paper
-            # num = torch.max(torch.abs(grads_PDE))
-            num = torch.mean(torch.abs(grads_PDE))
-            den = torch.mean(torch.abs(grads_dirichlet))
-            self.loss_weights['dirichlet'] = 0.9*self.loss_weights['dirichlet'] + 0.1*num/den
-            losses['dirichlet'] = self.loss_weights['dirichlet'] * \
-                losses['dirichlet']
-            if (self.dataset.counter>=1) and len(model_input['MPC_inputs'].shape)>2:
+                self.loss_weights['diff_constraint_hom']=1.0
+                params = OrderedDict(self.model.named_parameters())
+                # Gradients with respect to the PDE loss
+                self.optim.zero_grad()
+                losses['diff_constraint_hom'].backward(
+                    retain_graph=True)
+                grads_PDE = []
+                for key, param in params.items():
+                    grads_PDE.append(param.grad.view(-1))
+                grads_PDE = torch.cat(grads_PDE)
+
                 if MPC_decay_scheme=="exponential":
                     if self.MPC_importance_final<= self.MPC_importance_init:
                         self.mpc_importance_coef = self.MPC_importance_final * math.e**(math.log(self.MPC_importance_init/self.MPC_importance_final)*(1-(epoch - self.dataset.pretrain_iters)/(epochs - 1 - self.dataset.pretrain_iters))) 
@@ -1098,49 +1150,111 @@ class Experiment(ABC):
                 for key, param in params.items():
                     grads_mpc.append(param.grad.view(-1))
                 grads_mpc = torch.cat(grads_mpc)
-                # Set the new weight according to the paper 
+                # Set the new weight according to the paper
+                # num = torch.max(torch.abs(grads_PDE))
                 den = torch.mean(torch.abs(grads_mpc))
+                num = torch.mean(torch.abs(grads_PDE))
                 
-                self.loss_weights['mpc_loss'] = 0.9*self.loss_weights['mpc_loss'] + 0.1*self.mpc_importance_coef*num/(den+1e-16)
+                self.loss_weights['mpc_loss'] =min( 0.9*self.loss_weights['mpc_loss'] + 0.1*self.mpc_importance_coef*num/(den+1e-16), 1e5)
+        else:
+            if self.dataset.dynamics.deepReach_model in ['vanilla', 'diff']:
+                params = OrderedDict(self.model.named_parameters())
                 
-        elif self.dataset.dynamics.deepReach_model == 'exact' and (self.dataset.counter>=1) and losses['mpc_loss'] > 1e-8:
 
-            self.loss_weights['diff_constraint_hom']=1.0
-            params = OrderedDict(self.model.named_parameters())
-            # Gradients with respect to the PDE loss
-            self.optim.zero_grad()
-            losses['diff_constraint_hom'].backward(
-                retain_graph=True)
-            grads_PDE = []
-            for key, param in params.items():
-                grads_PDE.append(param.grad.view(-1))
-            grads_PDE = torch.cat(grads_PDE)
+                # Gradients with respect to the boundary loss
+                self.optim.zero_grad()
+                losses['dirichlet'].backward(retain_graph=True)
+                grads_dirichlet = []
+                for key, param in params.items():
+                    grads_dirichlet.append(param.grad.view(-1))
+                grads_dirichlet = torch.cat(grads_dirichlet)
 
-            if MPC_decay_scheme=="exponential":
-                if self.MPC_importance_final<= self.MPC_importance_init:
-                    self.mpc_importance_coef = self.MPC_importance_final * math.e**(math.log(self.MPC_importance_init/self.MPC_importance_final)*(1-(epoch - self.dataset.pretrain_iters)/(epochs - 1 - self.dataset.pretrain_iters))) 
-                else:
-                    self.mpc_importance_coef = self.MPC_importance_final * math.e**(math.log(self.MPC_importance_init/self.MPC_importance_final)*(epoch - self.dataset.pretrain_iters)/(epochs - 1 - self.dataset.pretrain_iters))
-                    self.mpc_importance_coef = self.MPC_importance_final + self.MPC_importance_init - self.mpc_importance_coef
-            elif MPC_decay_scheme=="linear":
-                self.mpc_importance_coef=self.MPC_importance_init+(self.MPC_importance_final-self.MPC_importance_init)*(epoch - self.dataset.pretrain_iters)/(epochs - self.dataset.pretrain_iters)
-            else: 
-                raise NotImplementedError
-            
-            # Gradients with respect to the mpc loss
-            self.optim.zero_grad()
-            losses['mpc_loss'].backward(retain_graph=True)
-            grads_mpc = []
-            for key, param in params.items():
-                grads_mpc.append(param.grad.view(-1))
-            grads_mpc = torch.cat(grads_mpc)
-            # Set the new weight according to the paper
-            # num = torch.max(torch.abs(grads_PDE))
-            den = torch.mean(torch.abs(grads_mpc))
-            num = torch.mean(torch.abs(grads_PDE))
-            
-            self.loss_weights['mpc_loss'] =min( 0.9*self.loss_weights['mpc_loss'] + 0.1*self.mpc_importance_coef*num/(den+1e-16), 1e5)
+                # Gradients with respect to the mpc loss
+                self.optim.zero_grad()
+                losses['mpc_loss'].backward(retain_graph=True)
+                grads_mpc = []
+                for key, param in params.items():
+                    grads_mpc.append(param.grad.view(-1))
+                grads_mpc = torch.cat(grads_mpc)
 
+                # Set the new weight for boundary loss and PDE loss
+                self.loss_weights['MPC_loss']=1.0
+                
+                # update boundary loss
+                num = torch.mean(torch.abs(grads_mpc))
+                den = torch.mean(torch.abs(grads_dirichlet))
+                self.loss_weights['dirichlet'] = 0.9*self.loss_weights['dirichlet'] + 0.1*1.0*num/den # make boundary condition very important
+
+                
+                if (self.dataset.counter>=1) and losses['diff_constraint_hom'] > 0.01:
+                    # update PDE loss, here the MPC importance is used as PDE importance
+                    # Gradients with respect to the PDE loss
+                    self.optim.zero_grad()
+                    losses['diff_constraint_hom'].backward(
+                        retain_graph=True)
+                    grads_PDE = []
+                    for key, param in params.items():
+                        # grads_PDE.append(param.grad.view(-1))
+                        if param.grad is not None:
+                            grads_PDE.append(param.grad.view(-1))
+
+                    grads_PDE = torch.cat(grads_PDE)
+                    
+                    if MPC_decay_scheme=="exponential":
+                        if self.MPC_importance_final<= self.MPC_importance_init:
+                            self.mpc_importance_coef = self.MPC_importance_final * math.e**(math.log(self.MPC_importance_init/self.MPC_importance_final)*(1-(min(self.dataset.counter,self.dataset.counter_end))/(self.dataset.counter_end))) 
+                        else:
+                            self.mpc_importance_coef = self.MPC_importance_final * math.e**(math.log(self.MPC_importance_init/self.MPC_importance_final)*min(self.dataset.counter,self.dataset.counter_end)/(self.dataset.counter_end))
+                            self.mpc_importance_coef = self.MPC_importance_final + self.MPC_importance_init - self.mpc_importance_coef
+                        # self.mpc_importance_coef = self.MPC_importance_final * math.e**(math.log(self.MPC_importance_init/self.MPC_importance_final)*(1-min(self.dataset.counter,self.dataset.counter_end)/(epochs - 1 - self.dataset.pretrain_iters))) 
+                    elif MPC_decay_scheme=="linear":
+                        self.mpc_importance_coef=self.MPC_importance_init+(self.MPC_importance_final-self.MPC_importance_init)*min(self.dataset.counter,self.dataset.counter_end)/(self.dataset.counter_end)
+                    else: 
+                        raise NotImplementedError
+                    den = torch.mean(torch.abs(grads_PDE))
+                    self.loss_weights['diff_constraint_hom'] = 0.9*self.loss_weights['diff_constraint_hom'] + 0.1*self.mpc_importance_coef*num/(den+1e-16)
+                    
+            elif self.dataset.dynamics.deepReach_model == 'exact' and (self.dataset.counter>=1) and losses['mpc_loss'] > 1e-8:
+
+                
+                params = OrderedDict(self.model.named_parameters())
+                # Gradients with respect to the PDE loss
+                self.optim.zero_grad()
+                losses['diff_constraint_hom'].backward(
+                    retain_graph=True)
+                grads_PDE = []
+                for key, param in params.items():
+                    grads_PDE.append(param.grad.view(-1))
+                grads_PDE = torch.cat(grads_PDE)
+
+                # Gradients with respect to the mpc loss
+                self.optim.zero_grad()
+                losses['mpc_loss'].backward(retain_graph=True)
+                grads_mpc = []
+                for key, param in params.items():
+                    grads_mpc.append(param.grad.view(-1))
+                grads_mpc = torch.cat(grads_mpc)
+                
+
+                # update loss: MPC_importance is used as PDE loss importance here
+                self.loss_weights['mpc_loss']=1.0
+
+                if MPC_decay_scheme=="exponential":
+                    if self.MPC_importance_final<= self.MPC_importance_init:
+                        self.mpc_importance_coef = self.MPC_importance_final * math.e**(math.log(self.MPC_importance_init/self.MPC_importance_final)*(1-(epoch - self.dataset.pretrain_iters)/(epochs - 1 - self.dataset.pretrain_iters))) 
+                    else:
+                        self.mpc_importance_coef = self.MPC_importance_final * math.e**(math.log(self.MPC_importance_init/self.MPC_importance_final)*(epoch - self.dataset.pretrain_iters)/(epochs - 1 - self.dataset.pretrain_iters))
+                        self.mpc_importance_coef = self.MPC_importance_final + self.MPC_importance_init - self.mpc_importance_coef
+                elif MPC_decay_scheme=="linear":
+                    self.mpc_importance_coef=self.MPC_importance_init+(self.MPC_importance_final-self.MPC_importance_init)*(epoch - self.dataset.pretrain_iters)/(epochs - self.dataset.pretrain_iters)
+                else: 
+                    raise NotImplementedError
+                
+                # Set the new weight according to the paper
+                num= torch.mean(torch.abs(grads_mpc))
+                den = torch.mean(torch.abs(grads_PDE))
+                self.loss_weights['diff_constraint_hom'] =0.9*self.loss_weights['diff_constraint_hom'] + 0.1*self.mpc_importance_coef*num/(den+1e-16)
+                
     def dataset_refinement(self, time_interval_length, epoch):
         if time_interval_length>=(self.last_refine_time+self.dataset.time_till_refinement) and self.dataset.use_MPC:
             # If we reach H_R (time_till_refinement), then we generate a new dataset
@@ -1157,7 +1271,7 @@ class Experiment(ABC):
             else:  # take extra care when time curriculum end, and transition to finetuning phase
                 self.dataset.use_terminal_MPC()
                 for g in self.optim.param_groups:
-                    g['lr'] = 1e-6 # TODO: make it a hyperparam
+                    g['lr'] = min(g['lr'],1e-6) # TODO: make it a hyperparam
                 self.use_MPC_terminal_loss=True
                 self.MPC_importance_final=1.0 # TODO: make it a hyperparam
                 self.MPC_importance_init=1.0
@@ -1171,7 +1285,7 @@ class Experiment(ABC):
         if time_interval_length>=self.dataset.tMax and epoch%self.dataset.epoch_till_refinement== 0 and self.dataset.use_MPC:
             # in case we want a long finetuning phase, we regenerate the dataset every epoch_till_refinement epochs
             for g in self.optim.param_groups:
-                g['lr'] = 1e-6
+                g['lr'] = min(g['lr'],1e-6)
             self.use_MPC_terminal_loss=True
             self.dataset.policy=self.model
             self.dataset.use_terminal_MPC()

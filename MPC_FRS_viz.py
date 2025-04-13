@@ -47,9 +47,10 @@ if __name__ == "__main__":
     else:
         device = torch.device('cpu')
    
-    dynamics_ = dynamics.Dubins10D()
+    # dynamics_ = dynamics.Dubins10D()
     # dynamics_ = dynamics.Dubins3DFRS()
-    T = 3.0
+    dynamics_ = dynamics.Dubins13D()
+    T = 2.0
     x_res=100
     y_res=100
     plot_config = dynamics_.plot_config()
@@ -63,7 +64,9 @@ if __name__ == "__main__":
     ys = torch.linspace(y_min, y_max, y_res)
     xys = torch.cartesian_prod(xs, ys).to(device)
     initial_condition_tensor=torch.zeros(x_res*y_res, dynamics_.state_dim).to(device)
-    state_slices=[0, 0, 0, 15, 16, 0., 1, -3, 1.6, 0.0]
+    # state_slices=[0, 0, 0, 15, 16, 0., 1, -2, 1.6, 0., -1, -4, 0]
+    
+    state_slices=[0, 0, 0, 15, 16, 0., 1, -2, 1.6, 0., 1, -2, 0]
     initial_condition_tensor[:, :] = torch.tensor(state_slices)
     initial_condition_tensor[:, plot_config['x_axis_idx']] = xys[:, 0]
     initial_condition_tensor[:, plot_config['y_axis_idx']] = xys[:, 1]
@@ -72,7 +75,7 @@ if __name__ == "__main__":
     # mpc = MPC_FRS.MPC_FRS(horizon=None, receding_horizon=-1, dT=0.1, num_samples=100, 
     #           dynamics_=dynamics_, num_iterative_refinement=10, device=device, style='direct')
     mpc = MPC_FRS.MPC_FRS(horizon=None, receding_horizon=1, dT=0.1, num_samples=100, 
-              dynamics_=dynamics_, num_iterative_refinement=10, device=device, style='receding')
+              dynamics_=dynamics_, num_iterative_refinement=10, device=device, style='receding',time_varying_control=True)
 
     costs=[]
     state_trajs=[]

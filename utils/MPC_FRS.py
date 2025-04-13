@@ -3,7 +3,8 @@ from tqdm import tqdm
 import math
 
 class MPC_FRS:
-    def __init__(self, dT, horizon, receding_horizon, num_samples, dynamics_, device, num_iterative_refinement=1, style='receding'):
+    def __init__(self, dT, horizon, receding_horizon, num_samples, dynamics_, device, num_iterative_refinement=1, style='receding', 
+                 time_varying_control=False):
         self.horizon = horizon
         self.num_samples = num_samples
         self.device = device
@@ -13,6 +14,7 @@ class MPC_FRS:
         self.num_iterative_refinement=num_iterative_refinement
         self.num_effective_horizon_refinement = 0
         self.style=style
+        self.time_varying_control=time_varying_control
   
     def get_batch_data(self, final_state_tensor, T, policy=None, t=0.0):
         '''
@@ -262,7 +264,11 @@ class MPC_FRS:
         
             self.control_tensors[:, k+policy_start_iter, :] = self.dynamics_.optimal_control(
                 traj_coords[:, 1:].to(self.device), traj_dvs[..., 1:].to(self.device))
-            self.control_tensors[:, k+policy_start_iter, :]=self.dynamics_.clamp_control(state_trajs[:, k, :], self.control_tensors[:, k+policy_start_iter, :])
+            if self.time_varying_control:
+                self.control_tensors[:, k+policy_start_iter, :]=self.dynamics_.clamp_control(state_trajs[:, k, :],
+                 self.control_tensors[:, k+policy_start_iter, :], (k+policy_start_iter)*self.dT, (policy_horizon+policy_start_iter)*self.dT)
+            else:
+                self.control_tensors[:, k+policy_start_iter, :]=self.dynamics_.clamp_control(state_trajs[:, k, :], self.control_tensors[:, k+policy_start_iter, :])
             state_trajs[:, k+1,:] = self.get_next_step_state(
                 state_trajs[:, k, :], self.control_tensors[:, k+policy_start_iter, :])
 
@@ -336,7 +342,11 @@ class MPC_FRS:
         state_trajs[:, :, 0, :] = initial_state_tensor.unsqueeze(1).repeat(1, self.num_samples, 1) # A * N * D
         
         for k in range(rollout_horizon):
-            permuted_controls[:, :, k, :]=self.dynamics_.clamp_control(state_trajs[:, :, k, :], permuted_controls[:, :, k, :])
+            if self.time_varying_control:
+                permuted_controls[:, :, k, :]=self.dynamics_.clamp_control(state_trajs[:, :, k, :], permuted_controls[:, :, k, :],
+                                            (k+start_iter)*self.dT, (rollout_horizon+start_iter)*self.dT)
+            else:
+                permuted_controls[:, :, k, :]=self.dynamics_.clamp_control(state_trajs[:, :, k, :], permuted_controls[:, :, k, :])
             state_trajs[:, :, k+1,:]= self.get_next_step_state(
                 state_trajs[:, :, k, :], permuted_controls[:, :, k, :])
 

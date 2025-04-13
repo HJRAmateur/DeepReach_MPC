@@ -127,6 +127,31 @@ class SingleBVPNet(nn.Module):
         output = self.net(coords_transformed)
         return {'model_in': coords_org, 'model_out': output}
 
+# class SingleBVPNet(nn.Module): #RELU NETWORK
+#     def __init__(self, out_features=1, type='sine', in_features=2,
+#                  mode='mlp', hidden_features=256, num_hidden_layers=3,periodic_transform_fn=None, **kwargs):
+#         super().__init__()
+#         self.mode = mode
+#         self.periodic_transform_fn=periodic_transform_fn
+#         self.net = nn.Sequential(
+#             nn.Linear(in_features, 512),
+#             nn.ReLU(),
+#             nn.Linear(512, 512),
+#             nn.ReLU(),
+#             nn.Linear(512, 512),
+#             nn.ReLU(),
+#             nn.Linear(512, out_features)
+#         )
+
+#     def forward(self, model_input, params=None):
+#         if params is None:
+#             params = OrderedDict(self.named_parameters())
+#         coords_org = model_input['coords'].clone(
+#         ).detach().requires_grad_(True)
+#         coords_transformed=self.periodic_transform_fn(coords_org)
+#         output = self.net(coords_transformed)
+#         return {'model_in': coords_org, 'model_out': output}
+
 class SingleBVPNetEval(nn.Module):
     '''A canonical representation network for a BVP.'''
 
