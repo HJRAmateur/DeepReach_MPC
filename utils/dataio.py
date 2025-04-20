@@ -88,7 +88,8 @@ class ReachabilityDataset(Dataset):
                     os.path.join(MPC_data_path, 'inputs.pt'))
                 self.MPC_values = torch.load(
                     os.path.join(MPC_data_path, 'value_labels.pt'))
-            self.mpc_time_sorted_indices = torch.argsort(self.MPC_inputs[:, 0])
+                self.mpc_time_sorted_indices = torch.argsort(
+                    self.MPC_inputs[:, 0])
 
     def use_terminal_MPC(self):
         # self.MPC_dt can be different
@@ -177,7 +178,7 @@ class ReachabilityDataset(Dataset):
             "./data/MPC_values_gpu%s.npy" % device_id, mmap_mode="r")
         self.MPC_inputs = torch.from_numpy(MPC_inputs_mmap).detach()
         self.MPC_values = torch.from_numpy(MPC_values_mmap).detach()
-
+        self.mpc_time_sorted_indices = torch.argsort(self.MPC_inputs[:, 0])
         print("Generated %d labels" % MPC_inputs.shape[0])
 
         del self.mpc  # free it to get some memory
