@@ -73,8 +73,7 @@ class Dynamics(ABC):
         elif self.deepReach_model == 'exact':
             return (output * input[..., 0] * self.value_var / self.value_normto) + self.boundary_fn(self.input_to_coord(input)[..., 1:])
         elif self.deepReach_model == 'exact_diff':
-            # V(x,t)= l(x) + NN(x,t) - NN(x,0)
-            # print(input.shape, output.shape)
+            # Another way to impose exact BC: V(x,t)= l(x) + NN(x,t) - NN(x,0)
             output0 = output[0].squeeze(dim=-1)
             output1 = output[1].squeeze(dim=-1)
             return (output0 - output1) * self.value_var / self.value_normto + self.boundary_fn(self.input_to_coord(input[0].detach())[..., 1:])
